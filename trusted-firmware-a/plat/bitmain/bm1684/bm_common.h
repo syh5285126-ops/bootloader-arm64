@@ -32,6 +32,7 @@ enum {
 	FIP_SRC_SPIF = 0x0, // SPI flash
 	FIP_SRC_SRAM = 0x1, // SRAM upper half
 	FIP_SRC_SDFT = 0x2, // SD card FAT32 partition
+	FIP_SRC_EMMC = 0x3, // eMMC raw partition
 };
 
 enum {
@@ -208,6 +209,7 @@ unsigned int bm_calc_core_pos(u_register_t mpidr);
 void bm_locate_next_image(void);
 void bm_pcie_status_init(void);
 int bm_get_sd_clock(void);
+int bm_get_emmc_clock(void);
 void bm_dump_nv_counter(const char *tag);
 
 uint32_t bm_gpio_read(uint32_t mask);
