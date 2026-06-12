@@ -739,3 +739,117 @@ int bm_sd_init(uint32_t flags)
 		ERROR("SD initialization failed %d\n", ret);
 	return ret;
 }
+
+extern int bm_get_emmc_clock(void);
+
+static bm_sd_params_t bm_emmc_params = {
+	.reg_base	= EMMC_BASE,
+	.clk_rate	= 100 * 1000 * 1000,
+	.bus_width	= MMC_BUS_WIDTH_4,
+	.flags		= 0,
+};
+
+static struct mmc_device_info emmc_info = {
+	.mmc_dev_type = MMC_IS_EMMC,
+};
+
+static const struct mmc_ops bm_emmc_ops = {
+	.init		= bm_sd_hw_init,
+	.send_cmd	= bm_sd_send_cmd,
+	.set_ios	= bm_sd_set_ios,
+	.prepare	= bm_sd_prepare,
+	.read		= bm_sd_read,
+	.write		= bm_sd_write,
+};
+
+static void bm_emmc_phy_init(void)
+{
+	uintptr_t base = EMMC_BASE;
+	int loop = 100;
+
+	/* reset hardware */
+	mmio_write_8(base + SDHCI_SOFTWARE_RESET, 0x7);
+	while (mmio_read_8(base + SDHCI_SOFTWARE_RESET)) {
+		if (loop-- > 0)
+			mdelay(10);
+		else
+			break;
+	}
+
+	/* Wait for the PHY power on ready */
+	loop = 100;
+	while (!(mmio_read_32(base + SDHCI_P_PHY_CNFG) & (1 << PHY_CNFG_PHY_PWRGOOD))) {
+		if (loop-- > 0)
+			mdelay(10);
+		else
+			break;
+	}
+
+	/* Assert reset of phy */
+	mmio_clrbits_32(base + SDHCI_P_PHY_CNFG, (1 << PHY_CNFG_PHY_RSTN));
+
+	/* Set PAD_SN PAD_SP */
+	mmio_write_32(base + SDHCI_P_PHY_CNFG,
+		      (1 << PHY_CNFG_PHY_PWRGOOD) | (0x9 << PHY_CNFG_PAD_SP) | (0x8 << PHY_CNFG_PAD_SN));
+
+	/* Set CMDPAD */
+	mmio_write_16(base + SDHCI_P_CMDPAD_CNFG,
+		      (0x2 << PAD_CNFG_RXSEL) | (1 << PAD_CNFG_WEAKPULL_EN) |
+		      (0x3 << PAD_CNFG_TXSLEW_CTRL_P) | (0x2 << PAD_CNFG_TXSLEW_CTRL_N));
+
+	/* Set DATAPAD */
+	mmio_write_16(base + SDHCI_P_DATPAD_CNFG,
+		      (0x2 << PAD_CNFG_RXSEL) | (1 << PAD_CNFG_WEAKPULL_EN) |
+		      (0x3 << PAD_CNFG_TXSLEW_CTRL_P) | (0x2 << PAD_CNFG_TXSLEW_CTRL_N));
+
+	/* Set CLKPAD */
+	mmio_write_16(base + SDHCI_P_CLKPAD_CNFG,
+		      (0x2 << PAD_CNFG_RXSEL) | (0x3 << PAD_CNFG_TXSLEW_CTRL_P) | (0x2 << PAD_CNFG_TXSLEW_CTRL_N));
+
+	/* Set STB_PAD */
+	mmio_write_16(base + SDHCI_P_STBPAD_CNFG,
+		      (0x2 << PAD_CNFG_RXSEL) | (0x2 << PAD_CNFG_WEAKPULL_EN) |
+		      (0x3 << PAD_CNFG_TXSLEW_CTRL_P) | (0x2 << PAD_CNFG_TXSLEW_CTRL_N));
+
+	/* Set RSTPAD */
+	mmio_write_16(base + SDHCI_P_RSTNPAD_CNFG,
+		      (0x2 << PAD_CNFG_RXSEL) | (1 << PAD_CNFG_WEAKPULL_EN) |
+		      (0x3 << PAD_CNFG_TXSLEW_CTRL_P) | (0x2 << PAD_CNFG_TXSLEW_CTRL_N));
+
+	/* Set SDCLKDL_CNFG, EXTDLY_EN = 1, fix delay */
+	mmio_write_8(base + SDHCI_P_SDCLKDL_CNFG, (1 << SDCLKDL_CNFG_EXTDLY_EN));
+
+	/* Set SMPLDL_CNFG: use INPSEL_CNFG=0x2 for eMMC (not bypass) */
+	mmio_write_8(base + SDHCI_P_SMPLDL_CNFG, (0x2 << SMPLDL_CNFG_INPSEL_CNFG));
+
+	/* Set ATDL_CNFG, tuning clk not used for init */
+	mmio_write_8(base + SDHCI_P_ATDL_CNFG, (2 << ATDL_CNFG_INPSEL_CNFG));
+
+	/* Deassert reset of phy */
+	mmio_setbits_32(base + SDHCI_P_PHY_CNFG, (1 << PHY_CNFG_PHY_RSTN));
+}
+
+int bm_emmc_init(uint32_t flags)
+{
+	int ret;
+
+	bm_emmc_params.clk_rate = bm_get_emmc_clock();
+	NOTICE("eMMC initializing %dHz\n", bm_emmc_params.clk_rate);
+
+	bm_emmc_params.flags = flags;
+
+	/* Switch bm_params to point at eMMC controller for shared ops */
+	bm_params.reg_base = bm_emmc_params.reg_base;
+	bm_params.clk_rate = bm_emmc_params.clk_rate;
+	bm_params.bus_width = bm_emmc_params.bus_width;
+	bm_params.flags = bm_emmc_params.flags;
+
+	bm_emmc_phy_init();
+
+	ret = mmc_init(&bm_emmc_ops, bm_emmc_params.clk_rate, bm_emmc_params.bus_width,
+		       bm_emmc_params.flags, &emmc_info);
+
+	if (ret != 0)
+		ERROR("eMMC initialization failed %d\n", ret);
+	return ret;
+}

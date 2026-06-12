@@ -174,5 +174,6 @@ typedef struct bm_sd_params {
 
 int bm_sd_card_detect(void);
 int bm_sd_init(uint32_t flags);
+int bm_emmc_init(uint32_t flags);
 
 #endif	/* __BM_SD_H__ */

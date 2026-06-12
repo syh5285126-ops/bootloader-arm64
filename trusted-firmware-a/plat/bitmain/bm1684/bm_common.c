@@ -243,6 +243,31 @@ int bm_get_sd_clock(void)
 	return clk_in_hz;
 }
 
+int bm_get_emmc_clock(void)
+{
+	uint32_t clk_in_hz;
+	uint32_t mode_sel = bm_gpio_read(BIT_MASK_GPIO_MODE_SEL);
+
+	switch (mode_sel) {
+	case MODE_NORMAL:
+		clk_in_hz = PLAT_BM_BOOT_EMMC_CLK_IN_HZ_NORMAL;
+		break;
+	case MODE_FAST:
+		clk_in_hz = PLAT_BM_BOOT_EMMC_CLK_IN_HZ_FAST;
+		break;
+	case MODE_SAFE:
+		clk_in_hz = PLAT_BM_BOOT_EMMC_CLK_IN_HZ_SAFE;
+		break;
+	case MODE_BYPASS:
+		clk_in_hz = PLAT_BM_BOOT_EMMC_CLK_IN_HZ_BYPASS;
+		break;
+	default:
+		clk_in_hz = PLAT_BM_BOOT_EMMC_CLK_IN_HZ_NORMAL;
+		break;
+	}
+	return clk_in_hz;
+}
+
 void bm_wdt_stop(void)
 {
 	mmio_clrbits_32(TOP_BASE + REG_TOP_CTRL, BIT_MASK_TOP_CTRL_SW_ROOT_RESET_EN);
