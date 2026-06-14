@@ -1,77 +1,79 @@
 /*
- * bm1684xSdhci.c — BM1684X Synopsys DesignWare SDHCI driver
+ * bm1684xSdhci.c — BM1684X Synopsys DesignWare SDHCI 驱动
  *
- * Self-contained: only depends on bm1684xSdhciHw.h and bm1684xSdhciOsal.h.
- * No VxWorks SDK headers required.
+ * 完全自包含：仅依赖 bm1684xSdhciHw.h 和 bm1684xSdhciOsal.h，
+ * 无需任何 VxWorks SDK 头文件。
  *
- * Two command-completion strategies are compiled in together and selected at
- * runtime based on whether the OSAL semaphore/IRQ callbacks are non-NULL:
+ * 命令完成等待策略在编译时同时编入，运行时根据 OSAL 信号量/中断
+ * 回调是否为非 NULL 自动选择：
  *
- *   Interrupt mode  – ISR clears status, signals semaphore; caller blocks.
- *   Polling mode    – caller spins on INT_STATUS register (no IRQ needed).
+ *   中断模式 — ISR 清除中断状态后通知信号量，调用方阻塞等待。
+ *   轮询模式 — 调用方循环读取 INT_STATUS 寄存器，无需中断支持。
  *
- * Copyright (c) 2024 Bitmain / Sophgo.  SPDX-License-Identifier: BSD-3-Clause
+ * 版权所有 (c) 2024 Bitmain / Sophgo.  SPDX-License-Identifier: BSD-3-Clause
  */
 
 #include "bm1684xSdhciHw.h"
 #include "bm1684xSdhciOsal.h"
 
 /* -------------------------------------------------------------------------
- * Private constants
+ * 私有常量
  * ------------------------------------------------------------------------- */
 
-#define SDHCI_CMD_TIMEOUT_MS    1000U
-#define SDHCI_XFER_TIMEOUT_MS   5000U
-#define SDHCI_RESET_TIMEOUT_US  100000U
-#define SDHCI_CLK_STABLE_US     150U
-#define SDHCI_PHY_RESET_US      20U
-#define SDHCI_MAX_DIVIDER       256U
+#define SDHCI_CMD_TIMEOUT_MS    1000U    /* 命令完成超时（毫秒） */
+#define SDHCI_XFER_TIMEOUT_MS   5000U   /* 数据传输超时（毫秒） */
+#define SDHCI_RESET_TIMEOUT_US  100000U /* 软复位等待上限（微秒） */
+#define SDHCI_CLK_STABLE_US     150U    /* 时钟稳定等待时间（微秒） */
+#define SDHCI_PHY_RESET_US      20U     /* PHY 复位后稳定时间（微秒） */
+#define SDHCI_MAX_DIVIDER       256U    /* 时钟分频器最大值 */
 
-/* Error codes returned by internal helpers */
+/* 内部错误码 */
 #define BM_OK                    0
-#define BM_ERR_TIMEOUT          (-1)
-#define BM_ERR_BADARG           (-2)
-#define BM_ERR_HW               (-3)
+#define BM_ERR_TIMEOUT          (-1)  /* 操作超时 */
+#define BM_ERR_BADARG           (-2)  /* 非法参数 */
+#define BM_ERR_HW               (-3)  /* 硬件错误 */
 
 /* -------------------------------------------------------------------------
- * Private device state
+ * 私有设备状态结构体
  * ------------------------------------------------------------------------- */
 
 struct BM1684X_SDHCI_DEV {
-    BM1684X_SDHCI_OSAL  osal;          /* copy of caller-supplied OSAL      */
-    void               *base;          /* virtual base from osal.iomap()    */
-    void               *topBase;       /* TOP register virtual base         */
-    unsigned int        irqNum;
-    unsigned int        devIndex;      /* 0=eMMC, 1=SD                      */
-    unsigned int        is64Bit;
-    unsigned int        clkInHz;       /* input clock from SoC              */
-    unsigned int        useIrq;        /* 1 when interrupt mode is active   */
-    void               *cmdSem;        /* semaphore for CMD_COMPLETE        */
-    void               *xferSem;       /* semaphore for XFER_COMPLETE       */
-    volatile unsigned int isrStatus;   /* raw INT_STATUS captured by ISR    */
-    volatile unsigned int isrErrSts;   /* raw ERR_INT_STATUS captured       */
-    /* static storage if osal.mem_alloc is NULL */
+    BM1684X_SDHCI_OSAL  osal;          /* 调用方传入的 OSAL 副本            */
+    void               *base;          /* SDHCI 寄存器虚拟基地址            */
+    void               *topBase;       /* TOP 寄存器虚拟基地址              */
+    unsigned int        irqNum;        /* 中断号                            */
+    unsigned int        devIndex;      /* 设备索引：0=eMMC，1=SD            */
+    unsigned int        is64Bit;       /* 1=使用 64 位 DMA 地址             */
+    unsigned int        clkInHz;       /* SoC 输入时钟频率（Hz）            */
+    unsigned int        useIrq;        /* 1=中断模式已激活                  */
+    void               *cmdSem;        /* CMD_COMPLETE 信号量               */
+    void               *xferSem;       /* XFER_COMPLETE 信号量              */
+    volatile unsigned int isrStatus;   /* ISR 捕获的 INT_STATUS 原始值      */
+    volatile unsigned int isrErrSts;   /* ISR 捕获的 ERR_INT_STATUS 原始值  */
+    /* 当 osal.mem_alloc 为 NULL 时使用静态存储 */
 };
 
-/* One statically allocated device for environments without a heap */
+/* 无堆环境下使用的静态设备结构体（全局唯一） */
 static struct BM1684X_SDHCI_DEV s_staticDev;
 
 /* -------------------------------------------------------------------------
- * Internal helpers: interrupt / polling wait
+ * 内部辅助：判断当前是否使用中断模式
  * ------------------------------------------------------------------------- */
 
 static int useIntMode(const struct BM1684X_SDHCI_DEV *pDev)
 {
+    /* useIrq 已在 init 阶段设置，此处再确认信号量回调仍有效 */
     return (pDev->useIrq &&
             pDev->osal.sem_wait   != (void *)0 &&
             pDev->osal.sem_signal != (void *)0);
 }
 
 /*
- * Wait for INT_STATUS to have any bit from `mask` set.
- * Polling path: spins calling udelay(1) until the bit appears or timeout.
- * Clears the matched bits before returning.
- * Returns 0 and writes matched status into *pSts on success.
+ * pollWaitStatus — 轮询等待 INT_STATUS 中指定位置位。
+ *
+ * 每次循环调用 udelay(1) 微秒，直到目标位出现或超时。
+ * 成功时清除已匹配的状态位，并通过 pSts 返回状态值。
+ * 返回 0 表示成功，BM_ERR_HW 表示硬件错误，BM_ERR_TIMEOUT 表示超时。
  */
 static int pollWaitStatus(struct BM1684X_SDHCI_DEV *pDev,
                           unsigned int mask, unsigned int timeoutMs,
@@ -79,13 +81,15 @@ static int pollWaitStatus(struct BM1684X_SDHCI_DEV *pDev,
 {
     unsigned int elapsed = 0;
     unsigned int sts;
-    unsigned int loops = timeoutMs * 1000U; /* 1 µs per loop */
+    unsigned int loops = timeoutMs * 1000U; /* 每次循环约 1 µs */
 
     while (elapsed < loops) {
+        /* 将普通中断状态（低 16 位）与错误状态（高 16 位）合并读取 */
         sts = (unsigned int)REG_RD16(pDev->base, SDHCI_INT_STATUS) |
               ((unsigned int)REG_RD16(pDev->base, SDHCI_ERR_INT_STATUS) << 16);
 
         if (sts & SDHCI_INT_ERROR) {
+            /* 发现硬件错误：清除错误状态位后立即返回 */
             REG_WR16(pDev->base, SDHCI_ERR_INT_STATUS,
                      REG_RD16(pDev->base, SDHCI_ERR_INT_STATUS));
             REG_WR16(pDev->base, SDHCI_INT_STATUS, SDHCI_INT_ERROR);
@@ -93,7 +97,7 @@ static int pollWaitStatus(struct BM1684X_SDHCI_DEV *pDev,
             return BM_ERR_HW;
         }
         if (sts & mask) {
-            /* clear matched normal bits */
+            /* 目标位已置位：写 1 清除已匹配的普通状态位 */
             REG_WR16(pDev->base, SDHCI_INT_STATUS,
                      (unsigned short)(sts & 0xFFFFU & mask));
             if (pSts) *pSts = sts;
@@ -106,8 +110,8 @@ static int pollWaitStatus(struct BM1684X_SDHCI_DEV *pDev,
 }
 
 /*
- * Interrupt-mode wait: block on semaphore, then read isrStatus set by ISR.
- * Returns 0 on success, BM_ERR_TIMEOUT or BM_ERR_HW on failure.
+ * irqWaitStatus — 中断模式等待：阻塞信号量，然后读取 ISR 保存的状态。
+ * 返回 0 表示成功，BM_ERR_TIMEOUT 或 BM_ERR_HW 表示失败。
  */
 static int irqWaitStatus(struct BM1684X_SDHCI_DEV *pDev,
                          void *sem, unsigned int timeoutMs,
@@ -126,7 +130,7 @@ static int irqWaitStatus(struct BM1684X_SDHCI_DEV *pDev,
 }
 
 /* -------------------------------------------------------------------------
- * Software reset helpers
+ * 软件复位辅助
  * ------------------------------------------------------------------------- */
 
 static int sdhciReset(struct BM1684X_SDHCI_DEV *pDev, unsigned char mask)
@@ -134,6 +138,7 @@ static int sdhciReset(struct BM1684X_SDHCI_DEV *pDev, unsigned char mask)
     unsigned int i;
 
     REG_WR8(pDev->base, SDHCI_SOFTWARE_RESET, mask);
+    /* 轮询等待复位完成（对应位自动清零） */
     for (i = 0; i < SDHCI_RESET_TIMEOUT_US; i++) {
         if ((REG_RD8(pDev->base, SDHCI_SOFTWARE_RESET) & mask) == 0)
             return BM_OK;
@@ -143,24 +148,26 @@ static int sdhciReset(struct BM1684X_SDHCI_DEV *pDev, unsigned char mask)
 }
 
 /* -------------------------------------------------------------------------
- * PHY initialisation  (14-step sequence from bm_sd.c / sdhci-bitmain.c)
- * devIndex 0 = eMMC (INPSEL feedback path), 1 = SD (bypass path)
+ * PHY 初始化（来自 bm_sd.c / sdhci-bitmain.c 的 14 步序列）
+ *
+ * devIndex 0 = eMMC：SMPLDL 使用内部反馈路径（INPSEL=0x2）
+ * devIndex 1 = SD  ：SMPLDL 使用旁路路径（BYPASS_EN=1）
  * ------------------------------------------------------------------------- */
 
 static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
 {
     unsigned int phyCnfg;
 
-    /* 1. Assert PHY reset (bit 0 = 0) */
+    /* 步骤 1：拉低 PHY_RSTN 使 PHY 进入复位状态 */
     phyCnfg = REG_RD32(pDev->base, SDHCI_P_PHY_CNFG);
     phyCnfg &= ~(1U << PHY_CNFG_PHY_RSTN);
     REG_WR32(pDev->base, SDHCI_P_PHY_CNFG, phyCnfg);
 
-    /* 2. PAD slew: SP=0x9, SN=0x8 */
+    /* 步骤 2：配置 PAD 驱动强度斜率：P 型=0x9，N 型=0x8 */
     phyCnfg = (0x9U << PHY_CNFG_PAD_SP) | (0x8U << PHY_CNFG_PAD_SN);
     REG_WR32(pDev->base, SDHCI_P_PHY_CNFG, phyCnfg);
 
-    /* 3. CMD pad: RXSEL=1, WEAKPULL_EN=1, TXSLEW_CTRL_P=0xA, TXSLEW_CTRL_N=6 */
+    /* 步骤 3：CMD PAD：RXSEL=1，弱上拉使能，P 斜率=0xA，N 斜率=6 */
     REG_WR16(pDev->base, SDHCI_P_CMDPAD_CNFG,
              (unsigned short)(
                  (1U << PAD_CNFG_RXSEL) |
@@ -168,7 +175,7 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
                  (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
                  (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 4. DAT pad: same as CMD */
+    /* 步骤 4：DAT PAD：配置与 CMD PAD 相同 */
     REG_WR16(pDev->base, SDHCI_P_DATPAD_CNFG,
              (unsigned short)(
                  (1U << PAD_CNFG_RXSEL) |
@@ -176,13 +183,13 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
                  (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
                  (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 5. CLK pad: RXSEL=0, WEAKPULL_EN=0, TXSLEW_CTRL_P=0xA, TXSLEW_CTRL_N=6 */
+    /* 步骤 5：CLK PAD：无上拉/下拉，RXSEL=0，仅设置斜率 */
     REG_WR16(pDev->base, SDHCI_P_CLKPAD_CNFG,
              (unsigned short)(
                  (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
                  (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 6. STB pad: RXSEL=1, WEAKPULL_EN=2 (pull-down), same slew */
+    /* 步骤 6：STB PAD：RXSEL=1，弱下拉（WEAKPULL_EN=2），同斜率 */
     REG_WR16(pDev->base, SDHCI_P_STBPAD_CNFG,
              (unsigned short)(
                  (1U << PAD_CNFG_RXSEL) |
@@ -190,7 +197,7 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
                  (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
                  (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 7. RST_N pad: RXSEL=1, WEAKPULL_EN=1, same slew */
+    /* 步骤 7：RST_N PAD：RXSEL=1，弱上拉，同斜率 */
     REG_WR16(pDev->base, SDHCI_P_RSTNPAD_CNFG,
              (unsigned short)(
                  (1U << PAD_CNFG_RXSEL) |
@@ -198,15 +205,17 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
                  (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
                  (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 8. COMMDL: bypass disabled */
+    /* 步骤 8：COMMDL：禁用旁路（使用延迟链） */
     REG_WR8(pDev->base, SDHCI_P_COMMDL_CNFG, 0);
 
-    /* 9. SDCLKDL: bypass enabled, DC = 0x0A */
+    /* 步骤 9：SDCLKDL：启用旁路，延迟步数默认 0x0A */
     REG_WR8(pDev->base, SDHCI_P_SDCLKDL_CNFG,
             (unsigned char)(1U << SDCLKDL_BYPASS_EN));
     REG_WR8(pDev->base, SDHCI_P_SDCLKDL_DC, SDCLKDL_DC_DEFAULT);
 
-    /* 10. SMPLDL: eMMC uses INPSEL=0x2; SD uses BYPASS */
+    /* 步骤 10：SMPLDL 采样路径
+     *   eMMC：使用内部反馈路径（INPSEL=0x2），提高采样稳定性
+     *   SD  ：使用旁路路径（BYPASS_EN=1），适合低速信号 */
     if (pDev->devIndex == BM1684X_EMMC_INDEX)
         REG_WR8(pDev->base, SDHCI_P_SMPLDL_CNFG,
                 (unsigned char)(0x2U << SMPLDL_INPSEL_CNFG));
@@ -214,19 +223,19 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
         REG_WR8(pDev->base, SDHCI_P_SMPLDL_CNFG,
                 (unsigned char)(1U << SMPLDL_BYPASS_EN));
 
-    /* 11. ATDL: bypass */
+    /* 步骤 11：ATDL：使用旁路路径 */
     REG_WR8(pDev->base, SDHCI_P_ATDL_CNFG,
             (unsigned char)(1U << ATDL_BYPASS_EN));
 
-    /* 12. Release PHY reset */
+    /* 步骤 12：释放 PHY 复位（PHY_RSTN 置 1） */
     phyCnfg = REG_RD32(pDev->base, SDHCI_P_PHY_CNFG);
     phyCnfg |= (1U << PHY_CNFG_PHY_RSTN);
     REG_WR32(pDev->base, SDHCI_P_PHY_CNFG, phyCnfg);
 
-    /* 13. Short delay for PHY to stabilise */
+    /* 步骤 13：等待 PHY 内部电路稳定 */
     if (pDev->osal.udelay) pDev->osal.udelay(SDHCI_PHY_RESET_US);
 
-    /* 14. Wait for PHY power-good */
+    /* 步骤 14：轮询 PHY_PWRGOOD 位，确认 PHY 上电完成 */
     {
         unsigned int i;
         for (i = 0; i < 1000U; i++) {
@@ -239,7 +248,7 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
 }
 
 /* -------------------------------------------------------------------------
- * Host controller hardware initialisation
+ * 主机控制器硬件初始化
  * ------------------------------------------------------------------------- */
 
 static int hwInit(struct BM1684X_SDHCI_DEV *pDev)
@@ -247,29 +256,29 @@ static int hwInit(struct BM1684X_SDHCI_DEV *pDev)
     unsigned short hc2;
     int rc;
 
-    /* Full software reset */
+    /* 全局软复位，清除所有内部状态 */
     rc = sdhciReset(pDev, SDHCI_RESET_ALL);
     if (rc != BM_OK) return rc;
 
-    /* Set version-4 mode, optionally 64-bit addressing, CMD23 support */
+    /* 启用版本 4 模式、可选 64 位地址、CMD23 预设块计数 */
     hc2 = (unsigned short)(SDHCI_HC2_VER4_ENABLE | SDHCI_HC2_CMD23_SUPPORT);
     if (pDev->is64Bit)
         hc2 |= (unsigned short)SDHCI_HC2_64BIT_ADDR;
     REG_WR16(pDev->base, SDHCI_HOST_CONTROL2, hc2);
 
-    /* Power on: 3.3 V */
+    /* 上电：选择 3.3 V 电压 */
     REG_WR8(pDev->base, SDHCI_POWER_CONTROL,
             (unsigned char)(SDHCI_POWER_ON | SDHCI_POWER_330));
 
-    /* Enable all normal + error status bits (masked from signalling) */
+    /* 使能全部普通及错误中断状态位（仅状态可见，中断信号默认关闭） */
     REG_WR16(pDev->base, SDHCI_INT_STATUS_EN,
              (unsigned short)(SDHCI_INT_ALL_NORMAL));
     REG_WR16(pDev->base, SDHCI_ERR_INT_STATUS_EN,
              (unsigned short)(SDHCI_INT_ALL_ERROR));
-    /* Signals disabled until a transfer is in flight */
+    /* 传输发起前不产生中断信号，按需开启 */
     REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN, 0);
 
-    /* DMA mode: SDMA (simple, no descriptor ring needed at this layer) */
+    /* DMA 模式：使用 SDMA（简单模式，无需描述符环） */
     {
         unsigned char hc1 = REG_RD8(pDev->base, SDHCI_HOST_CONTROL);
         hc1 = (unsigned char)((hc1 & ~(unsigned char)SDHCI_CTRL_DMA_MASK) |
@@ -277,14 +286,14 @@ static int hwInit(struct BM1684X_SDHCI_DEV *pDev)
         REG_WR8(pDev->base, SDHCI_HOST_CONTROL, hc1);
     }
 
-    /* PHY */
+    /* 执行 PHY 初始化序列 */
     phyInit(pDev);
 
     return BM_OK;
 }
 
 /* -------------------------------------------------------------------------
- * Clock control
+ * 时钟控制
  * ------------------------------------------------------------------------- */
 
 int bm1684xSdhciSetClk(BM1684X_SDHCI_DEV *pDev, unsigned int clkHz)
@@ -296,9 +305,10 @@ int bm1684xSdhciSetClk(BM1684X_SDHCI_DEV *pDev, unsigned int clkHz)
     if (!pDev || clkHz == 0)
         return BM_ERR_BADARG;
 
-    /* Stop clock */
+    /* 先停止时钟输出 */
     REG_WR16(pDev->base, SDHCI_CLOCK_CONTROL, 0);
 
+    /* 计算满足目标频率的最小分频比（偶数步进） */
     if (clkHz >= pDev->clkInHz) {
         div = 1U;
     } else {
@@ -308,7 +318,7 @@ int bm1684xSdhciSetClk(BM1684X_SDHCI_DEV *pDev, unsigned int clkHz)
         }
     }
 
-    /* SD Host spec: divider field = div/2 (0 means /1) */
+    /* SD 主机规范：分频字段 = div/2（0 表示直通，即 /1） */
     {
         unsigned int divField = (div > 1U) ? (div >> 1U) : 0U;
         clkCtrl = (unsigned short)(
@@ -317,14 +327,14 @@ int bm1684xSdhciSetClk(BM1684X_SDHCI_DEV *pDev, unsigned int clkHz)
     }
     REG_WR16(pDev->base, SDHCI_CLOCK_CONTROL, clkCtrl);
 
-    /* Wait for internal clock stable */
+    /* 等待内部时钟稳定 */
     for (i = 0; i < 150U; i++) {
         if (REG_RD16(pDev->base, SDHCI_CLOCK_CONTROL) & SDHCI_CLK_INT_STABLE)
             break;
         if (pDev->osal.udelay) pDev->osal.udelay(1);
     }
 
-    /* Enable SD clock to card */
+    /* 使能向卡输出时钟 */
     clkCtrl |= (unsigned short)SDHCI_CLK_CARD_EN;
     REG_WR16(pDev->base, SDHCI_CLOCK_CONTROL, clkCtrl);
 
@@ -333,7 +343,7 @@ int bm1684xSdhciSetClk(BM1684X_SDHCI_DEV *pDev, unsigned int clkHz)
 }
 
 /* -------------------------------------------------------------------------
- * Bus width
+ * 总线宽度设置
  * ------------------------------------------------------------------------- */
 
 int bm1684xSdhciSetBusWidth(BM1684X_SDHCI_DEV *pDev, unsigned int width)
@@ -349,14 +359,14 @@ int bm1684xSdhciSetBusWidth(BM1684X_SDHCI_DEV *pDev, unsigned int width)
         hc1 |= (unsigned char)SDHCI_CTRL_4BITBUS;
     else if (width == 8U)
         hc1 |= (unsigned char)SDHCI_CTRL_8BITBUS;
-    /* width == 1: both bits clear */
+    /* width == 1：两个位均清零，即 1 位模式 */
 
     REG_WR8(pDev->base, SDHCI_HOST_CONTROL, hc1);
     return BM_OK;
 }
 
 /* -------------------------------------------------------------------------
- * Build command register word from BM1684X_MMC_CMD descriptor
+ * 根据 BM1684X_MMC_CMD 描述符构建命令寄存器值
  * ------------------------------------------------------------------------- */
 
 static unsigned short buildCmdFlags(const BM1684X_MMC_CMD *pCmd,
@@ -369,28 +379,32 @@ static unsigned short buildCmdFlags(const BM1684X_MMC_CMD *pCmd,
         flags = SDHCI_CMD_RESP_NONE;
         break;
     case BM1684X_RESP_R2:
+        /* 136 位长响应，带 CRC 校验 */
         flags = SDHCI_CMD_RESP_LONG | SDHCI_CMD_CRC;
         break;
     case BM1684X_RESP_R3:
     case BM1684X_RESP_R4:
+        /* 无 CRC / 无索引检查的短响应（OCR、SDIO） */
         flags = SDHCI_CMD_RESP_SHORT;
         break;
     case BM1684X_RESP_R1B:
+        /* 短响应 + 忙碌信号，需等待 DAT0 空闲 */
         flags = SDHCI_CMD_RESP_SHORT_BUSY | SDHCI_CMD_CRC | SDHCI_CMD_INDEX_CHK;
         break;
     default:
+        /* R1/R5/R6/R7：标准短响应，带 CRC 和索引检查 */
         flags = SDHCI_CMD_RESP_SHORT | SDHCI_CMD_CRC | SDHCI_CMD_INDEX_CHK;
         break;
     }
 
     if (pData)
-        flags |= SDHCI_CMD_DATA;
+        flags |= SDHCI_CMD_DATA;  /* 命令携带数据传输 */
 
     return SDHCI_MAKE_CMD(pCmd->cmdIdx, flags);
 }
 
 /* -------------------------------------------------------------------------
- * Data transfer setup (SDMA)
+ * 构建 SDMA 数据传输模式寄存器值
  * ------------------------------------------------------------------------- */
 
 static unsigned short buildXferMode(const BM1684X_MMC_DATA *pData)
@@ -398,21 +412,23 @@ static unsigned short buildXferMode(const BM1684X_MMC_DATA *pData)
     unsigned short mode = SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN;
 
     if (pData->blkCount > 1U) {
+        /* 多块传输：使能多块模式并自动发送 CMD12 停止命令 */
         mode |= SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD12;
     }
     if (pData->flags & BM1684X_DATA_READ)
-        mode |= SDHCI_TRNS_READ;
+        mode |= SDHCI_TRNS_READ;  /* 读方向：数据从卡流向主机 */
 
     return mode;
 }
 
-/* forward declaration so IsrWrapper can reference it */
+/* 前向声明：使 IsrWrapper 能够引用公开 ISR 函数 */
 void bm1684xSdhciIsr(BM1684X_SDHCI_DEV *pDev);
 
 /* -------------------------------------------------------------------------
- * ISR — call from your RTOS ISR when the SDHCI interrupt fires
+ * 中断服务例程 — 在 RTOS ISR 中断上下文中调用
  * ------------------------------------------------------------------------- */
 
+/* 类型适配包装：OSAL irq_connect 要求 void (*)(void *)，此处做强制转换 */
 static void bm1684xSdhciIsrWrapper(void *arg)
 {
     bm1684xSdhciIsr((BM1684X_SDHCI_DEV *)arg);
@@ -425,37 +441,40 @@ void bm1684xSdhciIsr(BM1684X_SDHCI_DEV *pDev)
 
     if (!pDev || !pDev->useIrq) return;
 
+    /* 读取中断状态（需在清除前保存） */
     sts    = (unsigned int)REG_RD16(pDev->base, SDHCI_INT_STATUS);
     errSts = (unsigned int)REG_RD16(pDev->base, SDHCI_ERR_INT_STATUS);
 
-    /* Clear what we read (write-1-to-clear) */
+    /* 写 1 清除已读到的状态位（write-1-to-clear） */
     REG_WR16(pDev->base, SDHCI_ERR_INT_STATUS, (unsigned short)errSts);
     REG_WR16(pDev->base, SDHCI_INT_STATUS, (unsigned short)sts);
 
-    /* Mask signal enables so we don't re-enter while processing */
+    /* 关闭中断信号，防止处理期间重复进入 ISR */
     REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN, 0);
 
+    /* 将状态保存供 irqWaitStatus 读取，若有错误则合并错误标志 */
     pDev->isrStatus = sts | (errSts ? (unsigned int)SDHCI_INT_ERROR : 0U);
     pDev->isrErrSts = errSts;
 
-    /* SDMA boundary: reload DMA address to resume scatter */
+    /* SDMA 512 KB 边界中断：重新写入 DMA 地址寄存器以继续传输 */
     if (sts & SDHCI_INT_DMA_END) {
         unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
         REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
     }
 
-    /* Signal waiting thread */
+    /* 命令完成：唤醒等待 cmdSem 的线程 */
     if ((sts & SDHCI_INT_CMD_COMPLETE) && pDev->cmdSem &&
         pDev->osal.sem_signal)
         pDev->osal.sem_signal(pDev->cmdSem);
 
+    /* 传输完成或传输错误：唤醒等待 xferSem 的线程 */
     if ((sts & (SDHCI_INT_XFER_COMPLETE | SDHCI_INT_ERROR)) &&
         pDev->xferSem && pDev->osal.sem_signal)
         pDev->osal.sem_signal(pDev->xferSem);
 }
 
 /* -------------------------------------------------------------------------
- * Core send-command implementation
+ * 发送命令核心实现
  * ------------------------------------------------------------------------- */
 
 int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
@@ -471,7 +490,7 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
 
     if (!pDev || !pCmd) return BM_ERR_BADARG;
 
-    /* Wait for CMD (and DAT when needed) inhibit to clear */
+    /* 确定需要等待哪些 inhibit 位：有数据或 R1b 响应时还需等 DAT 通道空闲 */
     inhibitMask = SDHCI_STATE_CMD_INHIBIT;
     if (pData || pCmd->respType == BM1684X_RESP_R1B)
         inhibitMask |= SDHCI_STATE_DAT_INHIBIT;
@@ -487,7 +506,7 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
             return BM_ERR_TIMEOUT;
     }
 
-    /* Program data registers before writing the command */
+    /* 写入数据寄存器（必须在写命令前完成） */
     if (pData) {
         unsigned long dmaAddr = (unsigned long)(unsigned long long)(unsigned long)pData->buf;
 
@@ -496,7 +515,7 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
         REG_WR16(pDev->base, SDHCI_BLOCK_COUNT,
                  (unsigned short)(pData->blkCount & 0xFFFFU));
 
-        /* SDMA: write the DMA address (low 32-bit; high written separately if 64-bit) */
+        /* SDMA：写入 DMA 地址低 32 位；64 位模式下额外写高 32 位 */
         REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, (unsigned int)(dmaAddr & 0xFFFFFFFFUL));
         if (pDev->is64Bit)
             REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH,
@@ -508,29 +527,29 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
     REG_WR32(pDev->base, SDHCI_ARGUMENT, pCmd->cmdArg);
     cmdReg = buildCmdFlags(pCmd, pData);
 
-    /* -----------------------------------------------------------------------
-     * INTERRUPT MODE: enable signals, write command, wait on semaphore
-     * --------------------------------------------------------------------- */
+    /* =======================================================================
+     * 中断模式：使能中断信号 → 写命令 → 阻塞等待信号量
+     * ===================================================================== */
     if (useIntMode(pDev)) {
         pDev->isrStatus = 0;
         pDev->isrErrSts = 0;
 
-        /* Enable CMD_COMPLETE interrupt signal */
+        /* 使能核心中断信号（命令完成、传输完成、DMA 边界、错误） */
         REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN,
                  (unsigned short)SDHCI_INT_CORE_MASK);
 
-        /* Write transfer mode + command (32-bit combined write) */
+        /* 写传输模式和命令寄存器，触发命令发送 */
         REG_WR16(pDev->base, SDHCI_TRANSFER_MODE, xferMode);
         REG_WR16(pDev->base, SDHCI_COMMAND, cmdReg);
 
-        /* Wait for CMD_COMPLETE */
+        /* 等待 CMD_COMPLETE（超时 1000 ms） */
         rc = irqWaitStatus(pDev, pDev->cmdSem, SDHCI_CMD_TIMEOUT_MS, &sts);
         if (rc != BM_OK) {
             sdhciReset(pDev, SDHCI_RESET_CMD | SDHCI_RESET_DATA);
             return rc;
         }
 
-        /* Read back response */
+        /* 读取响应寄存器 */
         if (pCmd->respType == BM1684X_RESP_R2) {
             pCmd->resp[0] = REG_RD32(pDev->base, SDHCI_RESPONSE_0);
             pCmd->resp[1] = REG_RD32(pDev->base, SDHCI_RESPONSE_1);
@@ -541,11 +560,12 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
         }
 
         if (!pData) {
+            /* 纯命令传输：关闭中断信号后返回 */
             REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN, 0);
             return BM_OK;
         }
 
-        /* Re-arm for XFER_COMPLETE */
+        /* 重新使能中断，等待 XFER_COMPLETE（超时 5000 ms） */
         pDev->isrStatus = 0;
         pDev->isrErrSts = 0;
         REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN,
@@ -560,14 +580,14 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
         return BM_OK;
     }
 
-    /* -----------------------------------------------------------------------
-     * POLLING MODE: write command, spin on INT_STATUS
-     * --------------------------------------------------------------------- */
-    REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN, 0);   /* no interrupt signals */
+    /* =======================================================================
+     * 轮询模式：关闭中断信号 → 写命令 → 轮询 INT_STATUS
+     * ===================================================================== */
+    REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN, 0);  /* 确保不产生中断信号 */
     REG_WR16(pDev->base, SDHCI_TRANSFER_MODE, xferMode);
     REG_WR16(pDev->base, SDHCI_COMMAND, cmdReg);
 
-    /* Wait CMD_COMPLETE */
+    /* 轮询等待命令完成 */
     waitMask = SDHCI_INT_CMD_COMPLETE;
     rc = pollWaitStatus(pDev, waitMask, SDHCI_CMD_TIMEOUT_MS, &sts);
     if (rc != BM_OK) {
@@ -586,7 +606,7 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
 
     if (!pData) return BM_OK;
 
-    /* Poll XFER_COMPLETE (handling SDMA DMA_END boundary re-loads) */
+    /* 轮询等待数据传输完成（处理 SDMA 512 KB 边界重新加载） */
     for (;;) {
         rc = pollWaitStatus(pDev,
                             SDHCI_INT_XFER_COMPLETE | SDHCI_INT_DMA_END,
@@ -596,32 +616,33 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
             return rc;
         }
         if (sts & SDHCI_INT_DMA_END) {
-            /* SDMA 512 KB boundary: reload address to continue */
+            /* SDMA 边界：重写地址寄存器使 DMA 继续向后推进 */
             unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
             REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
         }
         if (sts & SDHCI_INT_XFER_COMPLETE)
-            break;
+            break;  /* 全部数据传输完成 */
     }
 
     return BM_OK;
 }
 
 /* -------------------------------------------------------------------------
- * Card detect
+ * 卡检测
  * ------------------------------------------------------------------------- */
 
 int bm1684xSdhciCardPresent(BM1684X_SDHCI_DEV *pDev)
 {
     if (!pDev) return 0;
-    /* eMMC is always present */
+    /* eMMC 焊接在板上，始终在位 */
     if (pDev->devIndex == BM1684X_EMMC_INDEX) return 1;
+    /* SD：读取 PRESENT_STATE 的卡检测位 */
     return (REG_RD32(pDev->base, SDHCI_PRESENT_STATE) &
             SDHCI_STATE_CARD_PRESENT) ? 1 : 0;
 }
 
 /* -------------------------------------------------------------------------
- * Input clock query (reads MODE_SEL from TOP registers)
+ * 从 TOP 寄存器读取 MODE_SEL 以确定输入时钟频率
  * ------------------------------------------------------------------------- */
 
 static unsigned int getInputClk(struct BM1684X_SDHCI_DEV *pDev)
@@ -633,13 +654,13 @@ static unsigned int getInputClk(struct BM1684X_SDHCI_DEV *pDev)
     modeSel = REG_RD32(pDev->topBase, BM1684X_TOP_CONF_INFO) & 0x7U;
 
     switch (modeSel) {
-    case BM1684X_MODE_BYPASS: return BM1684X_EMMC_CLK_BYPASS_HZ;
-    default:                  return BM1684X_EMMC_CLK_NORMAL_HZ;
+    case BM1684X_MODE_BYPASS: return BM1684X_EMMC_CLK_BYPASS_HZ;  /* 旁路模式 25 MHz */
+    default:                  return BM1684X_EMMC_CLK_NORMAL_HZ;   /* 其他模式 100 MHz */
     }
 }
 
 /* -------------------------------------------------------------------------
- * Public initialisation
+ * 公开初始化接口
  * ------------------------------------------------------------------------- */
 
 BM1684X_SDHCI_DEV *bm1684xSdhciInit(
@@ -652,19 +673,19 @@ BM1684X_SDHCI_DEV *bm1684xSdhciInit(
     struct BM1684X_SDHCI_DEV *pDev;
     int useIrq;
 
-    /* Allocate device struct */
+    /* 分配设备结构体：优先使用 OSAL 堆，否则使用静态全局变量 */
     if (pOsal && pOsal->mem_alloc) {
         pDev = (struct BM1684X_SDHCI_DEV *)pOsal->mem_alloc(
                    (unsigned int)sizeof(*pDev));
         if (!pDev) return (BM1684X_SDHCI_DEV *)0;
-        /* zero-init */
+        /* 手动清零（不依赖 memset） */
         {
             unsigned char *p = (unsigned char *)pDev;
             unsigned int   n = (unsigned int)sizeof(*pDev);
             while (n--) *p++ = 0;
         }
     } else {
-        /* use static storage, zero it */
+        /* 使用静态存储，同样清零 */
         pDev = &s_staticDev;
         {
             unsigned char *p = (unsigned char *)pDev;
@@ -673,23 +694,22 @@ BM1684X_SDHCI_DEV *bm1684xSdhciInit(
         }
     }
 
-    /* Copy OSAL */
+    /* 复制 OSAL 结构体 */
     if (pOsal) pDev->osal = *pOsal;
 
     pDev->irqNum   = irqNum;
     pDev->devIndex = devIndex;
     pDev->is64Bit  = is64BitAddr;
 
-    /* Map SDHCI registers */
+    /* 映射 SDHCI 寄存器：有 iomap 时调用，否则假定平坦映射直接使用物理地址 */
     if (pDev->osal.iomap) {
         pDev->base = pDev->osal.iomap(regPhysBase, 0x1000U);
     } else {
-        /* flat-mapped: cast physical address directly */
         pDev->base = (void *)(unsigned long)regPhysBase;
     }
     if (!pDev->base) goto fail;
 
-    /* Map TOP registers (optional: used for clock detection) */
+    /* 映射 TOP 寄存器（可选，用于读取 MODE_SEL 判断时钟频率） */
     if (pDev->osal.iomap) {
         pDev->topBase = pDev->osal.iomap(BM1684X_TOP_PHYS_BASE, 0x1000U);
     } else {
@@ -698,7 +718,7 @@ BM1684X_SDHCI_DEV *bm1684xSdhciInit(
 
     pDev->clkInHz = getInputClk(pDev);
 
-    /* Decide interrupt vs polling mode */
+    /* 判断是否启用中断模式：需要信号量和 IRQ 回调全部有效 */
     useIrq = (pDev->osal.sem_create  != (void *)0 &&
                pDev->osal.sem_wait   != (void *)0 &&
                pDev->osal.sem_signal != (void *)0 &&
@@ -706,30 +726,33 @@ BM1684X_SDHCI_DEV *bm1684xSdhciInit(
                pDev->osal.irq_enable != (void *)0);
 
     if (useIrq) {
+        /* 创建命令完成和数据传输完成两个信号量 */
         pDev->cmdSem  = pDev->osal.sem_create();
         pDev->xferSem = pDev->osal.sem_create();
         if (!pDev->cmdSem || !pDev->xferSem) {
-            useIrq = 0;
+            useIrq = 0;  /* 创建失败，回退到轮询模式 */
         } else {
+            /* 注册并使能中断 */
             if (pDev->osal.irq_connect(irqNum, bm1684xSdhciIsrWrapper, pDev) == 0 &&
                 pDev->osal.irq_enable(irqNum) == 0) {
-                pDev->useIrq = 1U;
+                pDev->useIrq = 1U;  /* 中断模式激活 */
             } else {
-                useIrq = 0;
+                useIrq = 0;  /* 注册失败，回退到轮询模式 */
             }
         }
     }
-    (void)useIrq; /* pDev->useIrq already set (or stays 0 = polling) */
+    (void)useIrq;  /* pDev->useIrq 已在上方设置，此处消除未使用警告 */
 
-    /* Hardware + PHY init */
+    /* 执行硬件初始化和 PHY 初始化 */
     if (hwInit(pDev) != BM_OK) goto fail;
 
-    /* Set identification clock */
+    /* 以识别频率（200 kHz）启动时钟，等待卡就绪 */
     bm1684xSdhciSetClk(pDev, BM1684X_EMMC_CLK_INIT_HZ);
 
     return (BM1684X_SDHCI_DEV *)pDev;
 
 fail:
+    /* 初始化失败：若使用了动态内存则释放 */
     if (pDev != &s_staticDev && pDev->osal.mem_free)
         pDev->osal.mem_free(pDev);
     return (BM1684X_SDHCI_DEV *)0;
