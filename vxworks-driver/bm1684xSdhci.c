@@ -286,6 +286,9 @@ static int hwInit(struct BM1684X_SDHCI_DEV *pDev)
         REG_WR8(pDev->base, SDHCI_HOST_CONTROL, hc1);
     }
 
+    /* 超时控制：设为最大值（TMCLK * 2^27），防止时钟提升后数据超时 */
+    REG_WR8(pDev->base, SDHCI_TIMEOUT_CONTROL, 0x0EU);
+
     /* 执行 PHY 初始化序列 */
     phyInit(pDev);
 
@@ -458,8 +461,15 @@ void bm1684xSdhciIsr(BM1684X_SDHCI_DEV *pDev)
 
     /* SDMA 512 KB 边界中断：重新写入 DMA 地址寄存器以继续传输 */
     if (sts & SDHCI_INT_DMA_END) {
-        unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
-        REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+        if (pDev->is64Bit) {
+            /* v4 + 64 位模式：地址更新在 ADMA_SA_LOW (0x58)，非 0x00 */
+            unsigned int sa = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
+            REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW,  sa);
+            REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH, 0U);
+        } else {
+            unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
+            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+        }
     }
 
     /* 命令完成：唤醒等待 cmdSem 的线程 */
@@ -512,14 +522,19 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
 
         REG_WR16(pDev->base, SDHCI_BLOCK_SIZE,
                  (unsigned short)SDHCI_MAKE_BLKSZ(7, pData->blkSize));
-        REG_WR16(pDev->base, SDHCI_BLOCK_COUNT,
-                 (unsigned short)(pData->blkCount & 0xFFFFU));
 
-        /* SDMA：写入 DMA 地址低 32 位；64 位模式下额外写高 32 位 */
-        REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, (unsigned int)(dmaAddr & 0xFFFFFFFFUL));
-        if (pDev->is64Bit)
-            REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH,
-                     (unsigned int)((dmaAddr >> 32) & 0xFFFFFFFFUL));
+        if (pDev->is64Bit) {
+            /* SDHCI v4 + 64 位地址模式：
+             * - 0x00 (DMA_ADDRESS) 已重映射为 32 位块计数，0x06 须清零
+             * - DMA 物理地址写入 ADMA_SA_LOW (0x58) + ADMA_SA_HIGH (0x5C) */
+            REG_WR16(pDev->base, SDHCI_BLOCK_COUNT, 0U);
+            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, (unsigned int)pData->blkCount);
+            REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW,  (unsigned int)(dmaAddr & 0xFFFFFFFFUL));
+            REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH, (unsigned int)((dmaAddr >> 32) & 0xFFFFFFFFUL));
+        } else {
+            REG_WR16(pDev->base, SDHCI_BLOCK_COUNT,  (unsigned short)(pData->blkCount & 0xFFFFU));
+            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS,  (unsigned int)(dmaAddr & 0xFFFFFFFFUL));
+        }
 
         xferMode = buildXferMode(pData);
     }
@@ -617,8 +632,14 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
         }
         if (sts & SDHCI_INT_DMA_END) {
             /* SDMA 边界：重写地址寄存器使 DMA 继续向后推进 */
-            unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
-            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+            if (pDev->is64Bit) {
+                unsigned int sa = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
+                REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW,  sa);
+                REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH, 0U);
+            } else {
+                unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
+                REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+            }
         }
         if (sts & SDHCI_INT_XFER_COMPLETE)
             break;  /* 全部数据传输完成 */
