@@ -312,6 +312,12 @@ extern "C" {
 #define REG_SET16(base, off, m) REG_WR16(base, off, REG_RD16(base, off) | (m))
 #define REG_CLR16(base, off, m) REG_WR16(base, off, (unsigned short)(REG_RD16(base, off) & ~(unsigned int)(m)))
 
+/* -------------------------------------------------------------------------
+ * 内存屏障：确保此前所有 MMIO 写操作在屏障之后的访问发出前真正到达硬件。
+ * 目标平台固定为 AArch64，直接使用 dsb 指令，不做架构可移植性处理。
+ * ------------------------------------------------------------------------- */
+#define BM_SDHCI_MB()  __asm__ __volatile__ ("dsb sy" : : : "memory")
+
 #ifdef __cplusplus
 }
 #endif

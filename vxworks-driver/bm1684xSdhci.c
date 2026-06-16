@@ -555,6 +555,11 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
 
         /* 写传输模式和命令寄存器，触发命令发送 */
         REG_WR16(pDev->base, SDHCI_TRANSFER_MODE, xferMode);
+
+        /* 内存屏障：确保上面所有数据/地址寄存器写入已真正到达控制器，
+         * 再触发 COMMAND 启动传输，避免 SDMA 引擎读到尚未落地的陈旧值。 */
+        BM_SDHCI_MB();
+
         REG_WR16(pDev->base, SDHCI_COMMAND, cmdReg);
 
         /* 等待 CMD_COMPLETE（超时 1000 ms） */
@@ -600,6 +605,11 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
      * ===================================================================== */
     REG_WR16(pDev->base, SDHCI_INT_SIGNAL_EN, 0);  /* 确保不产生中断信号 */
     REG_WR16(pDev->base, SDHCI_TRANSFER_MODE, xferMode);
+
+    /* 内存屏障：确保上面所有数据/地址寄存器写入已真正到达控制器，
+     * 再触发 COMMAND 启动传输，避免 SDMA 引擎读到尚未落地的陈旧值。 */
+    BM_SDHCI_MB();
+
     REG_WR16(pDev->base, SDHCI_COMMAND, cmdReg);
 
     /* 轮询等待命令完成 */
