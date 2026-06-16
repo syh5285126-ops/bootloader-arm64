@@ -500,10 +500,11 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
 
     if (!pDev || !pCmd) return BM_ERR_BADARG;
 
-    /* 确定需要等待哪些 inhibit 位：有数据或 R1b 响应时还需等 DAT 通道空闲 */
-    inhibitMask = SDHCI_STATE_CMD_INHIBIT;
-    if (pData || pCmd->respType == BM1684X_RESP_R1B)
-        inhibitMask |= SDHCI_STATE_DAT_INHIBIT;
+    /* 无条件等待 CMD 和 DAT 通道都空闲：上一条命令（如 R1b 响应的总线宽度切换）
+     * 可能仍占用 DAT 通道，即使当前命令本身不带数据也必须等它释放，否则会在
+     * 卡尚未完成上一动作时发出新命令，导致超时或后续数据传输出现 Data End Bit
+     * Error（参见 u-boot/drivers/mmc/sdhci.c 的 sdhci_send_command 实现）。 */
+    inhibitMask = SDHCI_STATE_CMD_INHIBIT | SDHCI_STATE_DAT_INHIBIT;
 
     {
         unsigned int i;
