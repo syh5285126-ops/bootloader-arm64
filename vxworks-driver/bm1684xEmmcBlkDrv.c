@@ -342,6 +342,14 @@ static int emmcCardIdentify(BM_EMMC_DRIVE *pDrive)
         return ERROR;
     }
 
+    /* 诊断：确认 EXT_CSD 是否真的收到了卡返回的数据，而不是全 0 的陈旧缓冲区 */
+    printk("eMMC: extCsd dump: rev=%d csdStruct=%d devType=0x%02x "
+           "secCount=%02x%02x%02x%02x bytes[0..7]=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+           extCsd[192], extCsd[194], extCsd[196],
+           extCsd[215], extCsd[214], extCsd[213], extCsd[212],
+           extCsd[0], extCsd[1], extCsd[2], extCsd[3],
+           extCsd[4], extCsd[5], extCsd[6], extCsd[7]);
+
     /* SEC_COUNT 为 4 字节小端，单位为 512 字节扇区 */
     pDrive->numOfSectors =
         ((unsigned int)extCsd[EXT_CSD_SEC_COUNT + 0]      ) |
