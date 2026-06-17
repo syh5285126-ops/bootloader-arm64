@@ -23,7 +23,10 @@
 #define SDHCI_CMD_TIMEOUT_MS    1000U    /* 命令完成超时（毫秒） */
 #define SDHCI_XFER_TIMEOUT_MS   5000U   /* 数据传输超时（毫秒） */
 #define SDHCI_RESET_TIMEOUT_US  100000U /* 软复位等待上限（微秒） */
-#define SDHCI_CLK_STABLE_US     150U    /* 时钟稳定等待时间（微秒） */
+#define SDHCI_CLK_STABLE_US     400U    /* 时钟稳定等待时间（微秒）：至少 74 个
+                                          * 初始化时钟周期（200 kHz 下约 370us），
+                                          * 对照 vxbBm1684xSdhci.c / bm_sd.c 取
+                                          * 400us 留余量，原来的 150us 不够 */
 #define SDHCI_PHY_RESET_US      20U     /* PHY 复位后稳定时间（微秒） */
 #define SDHCI_MAX_DIVIDER       256U    /* 时钟分频器最大值 */
 
@@ -350,8 +353,17 @@ int bm1684xSdhciSetClk(BM1684X_SDHCI_DEV *pDev, unsigned int clkHz)
         if (pDev->osal.udelay) pDev->osal.udelay(1);
     }
 
-    /* 使能向卡输出时钟 */
-    clkCtrl |= (unsigned short)SDHCI_CLK_CARD_EN;
+    /* 使能 PLL 并向卡输出时钟。
+     *
+     * 此前这里只置了 CARD_EN，没有同时置位 PLL_EN——对照三份参考实现
+     * （vxbBm1684xSdhci.c、trusted-firmware-a/drivers/bitmain/bm_sd.c、
+     * 以及同事移植到 Hypervisor 的 bm_sd.c）逐项核对后发现，三者使能时钟
+     * 输出时都同时置位 PLL_EN，且都等待至少 74 个初始化时钟周期（200 kHz
+     * 下约 370us）才认为时钟真正就绪，而不是只等一个很短的固定时间。
+     * 识别阶段命令跑在 200 kHz，时钟要求宽松，PLL 没锁定也可能凑合跑通，
+     * 但切到高速做数据传输（CMD16/CMD8 及后续读写）时，时钟源是否真正
+     * 锁定到 PLL 会直接影响信号完整性。 */
+    clkCtrl |= (unsigned short)(SDHCI_CLK_PLL_EN | SDHCI_CLK_CARD_EN);
     REG_WR16(pDev->base, SDHCI_CLOCK_CONTROL, clkCtrl);
 
     if (pDev->osal.udelay) pDev->osal.udelay(SDHCI_CLK_STABLE_US);
@@ -551,6 +563,31 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
         }
 
         xferMode = buildXferMode(pData);
+
+        /* 诊断（合并版）：发命令前把寄存器实际内容读回来打印，一次定位
+         * "控制器报成功但目的内存没被写入"到底是哪种原因：
+         *  - HC2 的 VER4_ENABLE(bit12)/64BIT(bit13) 是否真的置上（模式是否生效）
+         *  - 0x00 / ADMA_SA_LOW / ADMA_SA_HIGH 里实际是什么（地址写对寄存器没、
+         *    高位有没有被截断丢失）
+         *  - buf 指针原值 + unsigned long 宽度（顺带回答地址是否被截断这一问题）
+         * 三个怀疑（v4 模式没生效 / 地址截断 / 写错寄存器）当场全部可证伪。 */
+        {
+            unsigned int hc2  = (unsigned int)REG_RD16(pDev->base, SDHCI_HOST_CONTROL2);
+            unsigned int r00  = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
+            unsigned int saLo = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
+            unsigned int saHi = REG_RD32(pDev->base, SDHCI_ADMA_SA_HIGH);
+            unsigned int blksz= (unsigned int)REG_RD16(pDev->base, SDHCI_BLOCK_SIZE);
+            unsigned int blkct= (unsigned int)REG_RD16(pDev->base, SDHCI_BLOCK_COUNT);
+            unsigned long long bufp = (unsigned long long)(unsigned long)pData->buf;
+            printk("eMMC: dma diag(cmd%u): is64=%u HC2=0x%04x(VER4=%u 64BIT=%u) "
+                   "reg00=0x%08x SA_LO=0x%08x SA_HI=0x%08x blkSz=0x%04x blkCt=%u "
+                   "bufPtr=0x%08x_%08x sizeof(ul)=%u sizeof(ptr)=%u\n",
+                   pCmd->cmdIdx, pDev->is64Bit, hc2,
+                   (hc2 >> 12) & 0x1U, (hc2 >> 13) & 0x1U,
+                   r00, saLo, saHi, blksz, blkct,
+                   (unsigned int)(bufp >> 32), (unsigned int)(bufp & 0xFFFFFFFFULL),
+                   (unsigned int)sizeof(unsigned long), (unsigned int)sizeof(void *));
+        }
     }
 
     REG_WR32(pDev->base, SDHCI_ARGUMENT, pCmd->cmdArg);
