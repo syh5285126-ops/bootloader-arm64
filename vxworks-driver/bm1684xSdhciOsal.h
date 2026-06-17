@@ -173,6 +173,16 @@ void bm1684xSdhciIsr(BM1684X_SDHCI_DEV *pDev);
  */
 int bm1684xSdhciCardPresent(BM1684X_SDHCI_DEV *pDev);
 
+/*
+ * bm1684xSdhciGetLastDmaAddr — 诊断专用：读回当前 DMA 地址寄存器实际值。
+ *   64 位模式读 ADMA_SA_LOW/HIGH，32 位模式读 DMA_ADDRESS（pAddrHigh 置 0）。
+ *   仅用于排查"传输报告成功但目的缓冲区未被写入"问题，正常驱动逻辑不依赖
+ *   此接口。pAddrLow/pAddrHigh 可传 NULL 表示不关心该输出。
+ */
+void bm1684xSdhciGetLastDmaAddr(BM1684X_SDHCI_DEV *pDev,
+                                 unsigned int *pAddrLow,
+                                 unsigned int *pAddrHigh);
+
 #ifdef __cplusplus
 }
 #endif

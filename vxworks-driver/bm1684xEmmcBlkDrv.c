@@ -212,6 +212,15 @@ static int emmcCmd(BM_EMMC_DRIVE *pDrive, unsigned int idx,
 }
 
 /*
+ * 诊断专用：CMD8 发送前先用 CPU 把 bounceBuf 填成这个"毒药"模式（不经过
+ * DMA）。如果读回来的内容仍然是这个模式，说明 DMA 这次根本没有把卡返回
+ * 的数据写进来（残留的是诊断填充值，不是上一次真实数据，也不是真的全
+ * 0），借此把"DMA 真的没传数据"和"DRAM/卡上一次的残留数据被重复读到"
+ * 这两种情况区分开。排查结束后随本轮诊断代码一起删除。
+ */
+#define BM_EMMC_DIAG_POISON   0xA5U
+
+/*
  * emmcReadExtCsd — 通过 CMD8 读取 512 字节 EXT_CSD 到弹跳缓冲区。
  * 返回 0 成功。
  */
@@ -223,6 +232,10 @@ static int emmcReadExtCsd(BM_EMMC_DRIVE *pDrive, unsigned char *pExtCsd)
 
     memset(&cmd, 0, sizeof(cmd));
     memset(&data, 0, sizeof(data));
+
+    /* 诊断：发命令前先用 CPU 写一遍毒药模式，覆盖掉 DRAM 里可能残留的
+     * 上一次数据，确保事后能分辨这次 DMA 是否真的写入了新数据 */
+    memset(pDrive->bounceBuf, (int)BM_EMMC_DIAG_POISON, BM_EMMC_EXTCSD_SIZE);
 
     cmd.cmdIdx   = MMC_CMD_SEND_EXT_CSD;
     cmd.cmdArg   = 0;
@@ -236,6 +249,21 @@ static int emmcReadExtCsd(BM_EMMC_DRIVE *pDrive, unsigned char *pExtCsd)
     rc = bm1684xSdhciSendCmd(pDrive->pSdhci, &cmd, &data);
     if (rc != 0)
         return rc;
+
+    /* 诊断：控制器报告传输成功后，立即读回 DMA 地址寄存器实际值，与本次
+     * 发起传输前预期写入的 bounceBuf 地址比较，确认寄存器在传输完成时
+     * 是否仍指向预期位置（而不是被复位/覆盖/从未真正生效）。 */
+    {
+        unsigned int addrLow = 0, addrHigh = 0;
+        unsigned long expect = (unsigned long)(unsigned long long)(unsigned long)pDrive->bounceBuf;
+        bm1684xSdhciGetLastDmaAddr(pDrive->pSdhci, &addrLow, &addrHigh);
+        printk("eMMC: extCsd diag: dmaAddrReg=0x%08x_%08x expect=0x%08x_%08x %s\n",
+               addrHigh, addrLow,
+               (unsigned int)((unsigned long long)expect >> 32),
+               (unsigned int)(expect & 0xFFFFFFFFUL),
+               (((unsigned long long)addrHigh << 32) | addrLow) ==
+               (unsigned long long)expect ? "MATCH" : "MISMATCH");
+    }
 
     memcpy(pExtCsd, pDrive->bounceBuf, BM_EMMC_EXTCSD_SIZE);
     return 0;
@@ -349,6 +377,25 @@ static int emmcCardIdentify(BM_EMMC_DRIVE *pDrive)
            extCsd[215], extCsd[214], extCsd[213], extCsd[212],
            extCsd[0], extCsd[1], extCsd[2], extCsd[3],
            extCsd[4], extCsd[5], extCsd[6], extCsd[7]);
+
+    /* 诊断：判断这次读到的内容是否仍是发命令前 CPU 填的毒药模式（0xA5）。
+     * 是 → DMA 这次根本没有写入新数据，控制器/卡没有真正完成这次传输；
+     * 不是 → 这次确实发生了一次真实的数据写入（不论内容对不对）。 */
+    {
+        unsigned int j;
+        int allPoison = 1;
+        for (j = 0; j < BM_EMMC_EXTCSD_SIZE; j++) {
+            if (extCsd[j] != (unsigned char)BM_EMMC_DIAG_POISON) {
+                allPoison = 0;
+                break;
+            }
+        }
+        if (allPoison)
+            printk("eMMC: extCsd diag: buffer UNCHANGED from poison 0x%02x "
+                   "-> DMA did NOT write new data this time\n", BM_EMMC_DIAG_POISON);
+        else
+            printk("eMMC: extCsd diag: buffer WAS overwritten by DMA this time\n");
+    }
 
     /* SEC_COUNT 为 4 字节小端，单位为 512 字节扇区 */
     pDrive->numOfSectors =

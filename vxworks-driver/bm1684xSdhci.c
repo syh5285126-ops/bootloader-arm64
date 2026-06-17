@@ -687,6 +687,30 @@ int bm1684xSdhciCardPresent(BM1684X_SDHCI_DEV *pDev)
 }
 
 /* -------------------------------------------------------------------------
+ * 诊断专用：读回当前 DMA 地址寄存器的实际内容
+ *
+ * 本函数仅用于排查"控制器报告传输成功但目的缓冲区未被写入"问题：
+ * 调用方在 bm1684xSdhciSendCmd() 返回成功后立即调用，将读到的寄存器值
+ * 与发起传输前预期写入的地址比较，判断 64 位/32 位 DMA 地址寄存器在
+ * 传输完成时是否仍保持预期值（而不是被复位、被覆盖或从未生效）。
+ * ------------------------------------------------------------------------- */
+
+void bm1684xSdhciGetLastDmaAddr(BM1684X_SDHCI_DEV *pDev,
+                                 unsigned int *pAddrLow,
+                                 unsigned int *pAddrHigh)
+{
+    if (!pDev) return;
+
+    if (pDev->is64Bit) {
+        if (pAddrLow)  *pAddrLow  = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
+        if (pAddrHigh) *pAddrHigh = REG_RD32(pDev->base, SDHCI_ADMA_SA_HIGH);
+    } else {
+        if (pAddrLow)  *pAddrLow  = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
+        if (pAddrHigh) *pAddrHigh = 0U;
+    }
+}
+
+/* -------------------------------------------------------------------------
  * 从 TOP 寄存器读取 MODE_SEL 以确定输入时钟频率
  * ------------------------------------------------------------------------- */
 
