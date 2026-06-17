@@ -250,19 +250,28 @@ static int emmcReadExtCsd(BM_EMMC_DRIVE *pDrive, unsigned char *pExtCsd)
     if (rc != 0)
         return rc;
 
-    /* 诊断：控制器报告传输成功后，立即读回 DMA 地址寄存器实际值，与本次
-     * 发起传输前预期写入的 bounceBuf 地址比较，确认寄存器在传输完成时
-     * 是否仍指向预期位置（而不是被复位/覆盖/从未真正生效）。 */
+    /* 诊断：控制器报告传输成功后，立即读回 DMA 地址寄存器实际值。
+     *
+     * 注意：SDMA 系统地址寄存器（64 位模式下复用为 ADMA_SA_LOW/HIGH）在传输
+     * 过程中会随每次搬运的字节数硬件自增——一次成功的 512 字节传输完成后，
+     * 寄存器读回值应该是"起始地址 + 512"，而不是起始地址本身。之前那版诊断
+     * 直接拿寄存器值跟传输前的起始地址比较，即便传输完全正常也会报
+     * MISMATCH，结论不可信。这里改成同时打印寄存器原始值、起始地址、以及
+     * 二者的差值（delta），由 delta 是否恰好等于 BM_EMMC_EXTCSD_SIZE 来判断
+     * 寄存器自增行为是否正常，而不是简单比较是否相等。 */
     {
         unsigned int addrLow = 0, addrHigh = 0;
-        unsigned long expect = (unsigned long)(unsigned long long)(unsigned long)pDrive->bounceBuf;
+        unsigned long long start = (unsigned long long)(unsigned long)pDrive->bounceBuf;
+        unsigned long long reg;
+        long long delta;
         bm1684xSdhciGetLastDmaAddr(pDrive->pSdhci, &addrLow, &addrHigh);
-        printk("eMMC: extCsd diag: dmaAddrReg=0x%08x_%08x expect=0x%08x_%08x %s\n",
+        reg   = ((unsigned long long)addrHigh << 32) | addrLow;
+        delta = (long long)(reg - start);
+        printk("eMMC: extCsd diag: dmaAddrReg=0x%08x_%08x start=0x%08x_%08x delta=%lld (expectDelta=%u) %s\n",
                addrHigh, addrLow,
-               (unsigned int)((unsigned long long)expect >> 32),
-               (unsigned int)(expect & 0xFFFFFFFFUL),
-               (((unsigned long long)addrHigh << 32) | addrLow) ==
-               (unsigned long long)expect ? "MATCH" : "MISMATCH");
+               (unsigned int)(start >> 32), (unsigned int)(start & 0xFFFFFFFFUL),
+               delta, (unsigned int)BM_EMMC_EXTCSD_SIZE,
+               (delta == (long long)BM_EMMC_EXTCSD_SIZE) ? "DELTA-OK(自增正常)" : "DELTA-UNEXPECTED(需进一步排查)");
     }
 
     memcpy(pExtCsd, pDrive->bounceBuf, BM_EMMC_EXTCSD_SIZE);
