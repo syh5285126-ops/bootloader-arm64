@@ -292,6 +292,16 @@ static int hwInit(struct BM1684X_SDHCI_DEV *pDev)
     /* 超时控制：设为最大值（TMCLK * 2^27），防止时钟提升后数据超时 */
     REG_WR8(pDev->base, SDHCI_TIMEOUT_CONTROL, 0x0EU);
 
+    /* 通过厂商扩展寄存器将设备标记为 eMMC（CARD_IS_EMMC，bit0）。
+     * vxbBm1684xSdhci.c 与 u-boot/sdhci-bitmain.c 均设置此位，此前本文件
+     * 遗漏，导致控制器仍按通用 SD 卡逻辑处理（如只读检测等），与已验证
+     * 实现不一致。 */
+    {
+        unsigned int vendorOff = REG_RD16(pDev->base, SDHCI_VENDOR_SPECIFIC_AREA) & 0x0FFFU;
+        REG_WR16(pDev->base, vendorOff + SDHCI_EMMC_CTRL_R_OFF,
+                 (unsigned short)(REG_RD16(pDev->base, vendorOff + SDHCI_EMMC_CTRL_R_OFF) | 0x1U));
+    }
+
     /* 执行 PHY 初始化序列 */
     phyInit(pDev);
 
