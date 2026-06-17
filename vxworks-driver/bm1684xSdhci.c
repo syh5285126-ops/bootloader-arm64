@@ -167,50 +167,52 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
     phyCnfg = (0x9U << PHY_CNFG_PAD_SP) | (0x8U << PHY_CNFG_PAD_SN);
     REG_WR32(pDev->base, SDHCI_P_PHY_CNFG, phyCnfg);
 
-    /* 步骤 3：CMD PAD：RXSEL=1，弱上拉使能，P 斜率=0xA，N 斜率=6 */
+    /* 步骤 3：CMD PAD：RXSEL=2，弱上拉使能，P 斜率=0x3，N 斜率=0x2
+     * （与 TFA bm_emmc_phy_init() / vxbBm1684xSdhci.c 已验证一致的取值对齐） */
     REG_WR16(pDev->base, SDHCI_P_CMDPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (1U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U << PAD_CNFG_TXSLEW_CTRL_N)));
 
     /* 步骤 4：DAT PAD：配置与 CMD PAD 相同 */
     REG_WR16(pDev->base, SDHCI_P_DATPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (1U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 步骤 5：CLK PAD：无上拉/下拉，RXSEL=0，仅设置斜率 */
+    /* 步骤 5：CLK PAD：无上拉/下拉，RXSEL=2，同斜率 */
     REG_WR16(pDev->base, SDHCI_P_CLKPAD_CNFG,
              (unsigned short)(
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (2U << PAD_CNFG_RXSEL) |
+                 (3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 步骤 6：STB PAD：RXSEL=1，弱下拉（WEAKPULL_EN=2），同斜率 */
+    /* 步骤 6：STB PAD：RXSEL=2，弱下拉（WEAKPULL_EN=2），同斜率 */
     REG_WR16(pDev->base, SDHCI_P_STBPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (2U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 步骤 7：RST_N PAD：RXSEL=1，弱上拉，同斜率 */
+    /* 步骤 7：RST_N PAD：RXSEL=2，弱上拉，同斜率 */
     REG_WR16(pDev->base, SDHCI_P_RSTNPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (1U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U << PAD_CNFG_TXSLEW_CTRL_N)));
 
     /* 步骤 8：COMMDL：禁用旁路（使用延迟链） */
     REG_WR8(pDev->base, SDHCI_P_COMMDL_CNFG, 0);
 
-    /* 步骤 9：SDCLKDL：启用旁路，延迟步数默认 0x0A */
+    /* 步骤 9：SDCLKDL：启用扩展延迟（EXTDLY_EN），延迟步数默认 0x0A */
     REG_WR8(pDev->base, SDHCI_P_SDCLKDL_CNFG,
-            (unsigned char)(1U << SDCLKDL_BYPASS_EN));
+            (unsigned char)(1U << SDCLKDL_EXTDLY_EN));
     REG_WR8(pDev->base, SDHCI_P_SDCLKDL_DC, SDCLKDL_DC_DEFAULT);
 
     /* 步骤 10：SMPLDL 采样路径
@@ -223,9 +225,10 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
         REG_WR8(pDev->base, SDHCI_P_SMPLDL_CNFG,
                 (unsigned char)(1U << SMPLDL_BYPASS_EN));
 
-    /* 步骤 11：ATDL：使用旁路路径 */
+    /* 步骤 11：ATDL：初始化阶段使用内部路径（INPSEL_CNFG=0x2），
+     * 与 TFA bm_emmc_phy_init() / vxbBm1684xSdhci.c 已验证一致的取值对齐 */
     REG_WR8(pDev->base, SDHCI_P_ATDL_CNFG,
-            (unsigned char)(1U << ATDL_BYPASS_EN));
+            (unsigned char)(2U << ATDL_INPSEL_CNFG));
 
     /* 步骤 12：释放 PHY 复位（PHY_RSTN 置 1） */
     phyCnfg = REG_RD32(pDev->base, SDHCI_P_PHY_CNFG);
