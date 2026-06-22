@@ -30,9 +30,14 @@
 ## 一句话目标
 给 BM1684X 的 eMMC 写**天脉3（AcoreOS3）**驱动：照搬 rk3588 项目"天脉原生块设备 + 天脉自带 FAT"的装载方式，让系统能用标准 `open/read/write` 读写 BM1684X eMMC 上的文件。
 
-## 已确认的需求边界
-- 目标系统 **天脉3**（2026-06-18 已确认）。
-- 其余边界条件（是否纯数据盘、PIO 还是 DMA、启动方式）**尚未访谈**，下面"待核对的核心假设/缺口"列出的都是需要你逐项拍板、或我们后续走一次完整访谈才能定的点，不要当成已经定案。
+## 已确认的需求边界（访谈结论，改动前先看）
+- 目标系统 **天脉3**。
+- **启动方式**：U-Boot 从 flash/网络/SD 卡加载天脉3，**不经过 eMMC**。
+- **eMMC 是纯数据盘**（跟 rk3588 一样），可整盘格式化（前提：盘上现在没有要保留的数据，烧板前请再次确认）。
+- **PHY/时钟初始化由驱动自己做**：因为引导不碰 eMMC，不能假设控制器已被配置好，驱动要照搬 TF-A `bm_emmc_phy_init()` 那套 14 步 PHY 时序自己初始化一遍。这点和 rk3588（U-Boot 已配好、驱动不碰）**不同**，是本项目最大的差异点。
+- **传输方式选 DMA（SDMA）**：沿用现有引擎层 `bm1684xSdhci.c` 的 SDMA 路径，**不**照搬 rk3588"先求稳用 PIO"的选择，不用补 PIO 路径。
+  - 风险提示（已告知，用户选择接受）：DMA 要求天脉3 给驱动的数据缓冲区物理连续、且 cache 一致——要么用天脉3 的 DMA 专用内存分配接口，要么读写前后手动刷新/失效 cache。集成时必须验证这一点，否则会出现"偶发读出脏数据"这类难查的问题。
+- 容量来源：**EXT_CSD 的 SEC_COUNT**（与 rk3588 做法一致）。
 
 ## 硬件事实
 BM1684X eMMC = **Synopsys DesignWare MSHC（SDHCI 标准兼容 + Synopsys PHY + Bitmain 厂商扩展）**
@@ -65,15 +70,14 @@ BM1684X eMMC = **Synopsys DesignWare MSHC（SDHCI 标准兼容 + Synopsys PHY + 
 - 编译时是否要排除别的 eMMC/SD 旧实现以免符号冲突——需要先确认天脉3工程模板里有没有自带的 BM1684X eMMC 驱动样板（类似 rk3588 项目里需要排除的复旦微底层）
 - 可调参数（时钟、总线宽度、PIO/DMA 选择）集中放一个头文件，不稳就能直接降参数，不用改散落在各处的代码
 
-## 待核对的核心假设/缺口（本次"查漏补缺"结论，需要你或 codex 逐项拍板）
-1. **PIO 还是 DMA**：rk3588 为求稳选择了 PIO（不用 DMA）。BM1684X 现有引擎层 `bm1684xSdhci.c` **只实现了 SDMA 一条路径**（`buildXferMode()` 里固定带 `SDHCI_TRNS_DMA` 位），没有逐字节走 `BUF_DATA` 寄存器的 PIO 实现。TF-A 侧 `bm_sd.h` 里定义了 `SD_USE_PIO` 标志位，但只用于 bl2 引导阶段加载固件，运行时引擎层没有照搬这个选项。如果要复刻 rk3588"先求稳"的思路，这层需要补一条 PIO 路径；如果决定保留 DMA，要说清楚理由（比如天脉3 对 cache 一致性/scatter-gather 支持没问题）。
-2. **eMMC 是不是纯数据盘**：rk3588 场景里 eMMC 是纯数据盘，系统启动在 flash。但 BM1684X 官方文档（`docs/bm1684x/bm1684x-soft-dev-doc/1_BM1684X-software.rst`）显示**标准 Linux/buildroot 方案是直接从 eMMC 启动**（boot0 分区放 u-boot env，`emmcboot.itb` 放 kernel），跟 rk3588 的假设正好相反。需要确认天脉3这套方案里 BM1684X 到底走哪条路：跟 Linux 一样从 eMMC 启动，还是另走 SPI flash 之类介质启动、eMMC 只当数据盘——这直接决定驱动能不能"整盘格式化"。
-3. **PHY/时钟初始化由谁负责**：现有的 eMMC PHY 初始化代码在 ARM TF-A 的 bl2 阶段（`bm_emmc_phy_init()`），目的是加载 FIP/BL31。需要确认天脉3启动时会不会经过这一段 TF-A 流程：如果会，天脉3接管 eMMC 时 PHY/时钟已经配好，驱动可以像 rk3588 一样不碰这部分；如果天脉3是另起一套独立引导（不经过这段 TF-A），就要把 PHY/时钟初始化也搬进驱动自己做一遍。
-4. **卡初始化与容量探测整层缺失**：无论是 VxWorks 版还是自包含引擎版，现有代码都没有实现 CMD0/CMD1(或CMD8+ACMD41)/CMD2/CMD3/CMD9/CMD7/CMD6 这套 MMC 初始化序列，也没有解析 EXT_CSD 拿 `SEC_COUNT` 容量——VxWorks 版这部分是交给 VxWorks SDK 自带的 SD/MMC 协议栈做的，天脉3没有这套协议栈，必须新写，对应 rk3588 项目的 `rk_emmc_core.c`。
-5. **对接天脉 FAT 的 glue 层完全没有**：rk3588 项目里这层（复用 `fatBlkDrvDemo_os3.c` + 新写 `rk_emmc_glue.c`）是把 `blkDevRd/Wrt` 接到驱动的关键缝合点；bootloader-arm64 目前一行都没有，需要从 rk3588 项目把 `fatBlkDrvDemo_os3.c` 模板搬过来改容量/基址。
-6. **没有总开关宏、没有自检入口、没有集成说明文档**：rk3588 有 `RK3588_EMMC` 总开关、`rk_emmc_selftest(lba)` 自检入口、`README_RK3588_eMMC_天脉3适配说明.md`；bootloader-arm64 目前一个都没有，建完中间两层后要补齐。
+## 待核对的核心假设/缺口（启动方式、纯数据盘、PHY 归属、DMA/PIO 已在访谈中拍板，下面是剩余缺口）
+1. **卡初始化与容量探测整层缺失**：无论是 VxWorks 版还是自包含引擎版，现有代码都没有实现 CMD0/CMD1(或CMD8+ACMD41)/CMD2/CMD3/CMD9/CMD7/CMD6 这套 MMC 初始化序列，也没有解析 EXT_CSD 拿 `SEC_COUNT` 容量——VxWorks 版这部分是交给 VxWorks SDK 自带的 SD/MMC 协议栈做的，天脉3没有这套协议栈，必须新写，对应 rk3588 项目的 `rk_emmc_core.c`。这一层还要新增 PHY/时钟初始化（搬 TF-A `bm_emmc_phy_init()` 的 14 步时序），因为已确认引导不会代劳。
+2. **对接天脉 FAT 的 glue 层完全没有**：rk3588 项目里这层（复用 `fatBlkDrvDemo_os3.c` + 新写 `rk_emmc_glue.c`）是把 `blkDevRd/Wrt` 接到驱动的关键缝合点；bootloader-arm64 目前一行都没有，需要从 rk3588 项目把 `fatBlkDrvDemo_os3.c` 模板搬过来改容量/基址。
+3. **DMA 缓冲区的物理连续性 / cache 一致性怎么保证**：已确认走 DMA，但天脉3 这边提供的内存分配接口能不能保证物理连续、cache 是否需要手动维护，目前未知，需要查天脉3 文档或问厂商确认。
+4. **没有总开关宏、没有自检入口、没有集成说明文档**：rk3588 有 `RK3588_EMMC` 总开关、`rk_emmc_selftest(lba)` 自检入口、`README_RK3588_eMMC_天脉3适配说明.md`；bootloader-arm64 目前一个都没有，建完中间两层后要补齐。
+5. **中断号未定**：eMMC 中断号现在靠调用方传入，没有固化的常量，需要从 BM1684X 中断分配表核实后写进配置头。
 
 ## 工作方式约束
 - 本地无法编译天脉3固件（没有天脉3工具链/头文件）：交付源码，由你在天脉 IDE 编译、烧板验证。
 - 你有板可测；后续补齐核心层后，应仿照 rk3588 项目提供一个上板自检入口。
-- 缺口里第 1～4 项涉及系统设计取舍，按"角色与系统设计规范"，下一步应该是逐项访谈确认，而不是直接开始写代码。
+- 启动方式、纯数据盘、PHY 归属、DMA/PIO 这几项系统设计取舍已访谈确认（见上）；剩下的缺口（核心层、glue 层、配置头/自检/文档）下一步是出具体实现方案，而不是直接开始写代码。
