@@ -36,7 +36,9 @@
 - **eMMC 是纯数据盘**（跟 rk3588 一样），可整盘格式化（前提：盘上现在没有要保留的数据，烧板前请再次确认）。
 - **PHY/时钟初始化由驱动自己做**：因为引导不碰 eMMC，不能假设控制器已被配置好，驱动要照搬 TF-A `bm_emmc_phy_init()` 那套 14 步 PHY 时序自己初始化一遍。这点和 rk3588（U-Boot 已配好、驱动不碰）**不同**，是本项目最大的差异点。
 - **传输方式选 DMA（SDMA）**：沿用现有引擎层 `bm1684xSdhci.c` 的 SDMA 路径，**不**照搬 rk3588"先求稳用 PIO"的选择，不用补 PIO 路径。
-  - 风险提示（已告知，用户选择接受）：DMA 要求天脉3 给驱动的数据缓冲区物理连续、且 cache 一致——要么用天脉3 的 DMA 专用内存分配接口，要么读写前后手动刷新/失效 cache。集成时必须验证这一点，否则会出现"偶发读出脏数据"这类难查的问题。
+- **初始时钟 25MHz、4 位总线、关闭 DLL 时序补偿**：跟 BM1684X 自己文档里的"安全档"（bypass 挡 25MHz）一致，先求稳；总线宽度选 4 位（跟 rk3588 一样），不是性能最高的 8 位。后续验证稳定后可以再调高，调参数走配置头，不改代码。
+- **天脉3 物理地址 1:1 平坦映射**（已向用户确认，跟 rk3588 假设一致）：没有 MMU 地址翻译，驱动拿到的指针数值可以直接当物理地址用，不用额外做地址转换。
+- **DMA 缓冲区 cache 一致性接口已确认**：天脉3 提供 `ACoreOs_cache_flush(addr, len)` / `ACoreOs_cache_invalidate(addr, len)`（地址+长度两个参数）。约定：**写卡前**对发送缓冲区调用 `flush`（把 CPU 缓存里的最新数据刷到内存，DMA 才能读到正确内容）；**读卡完成后**对接收缓冲区调用 `invalidate`（强制 CPU 重新从内存读取 DMA 刚写入的数据，不读到缓存里的旧值）。
 - 容量来源：**EXT_CSD 的 SEC_COUNT**（与 rk3588 做法一致）。
 
 ## 硬件事实
@@ -44,40 +46,50 @@ BM1684X eMMC = **Synopsys DesignWare MSHC（SDHCI 标准兼容 + Synopsys PHY + 
 - eMMC 控制器基址 `0x50100000`，SD/SDIO 控制器基址 `0x50101000`（寄存器布局相同，只是基址不同）
 - TOP 域时钟/复位寄存器：`TOP_BASE = 0x50010000`，软复位在 `+0xC00`（bit20=eMMC，bit21=SDIO），时钟使能在 `+0x800`
 - Synopsys 标准 PHY 寄存器在控制器内偏移 `0x300`，Bitmain 厂商调优寄存器在偏移 `0x500`
-- 中断号：现有代码里没有固化具体中断号，靠调用方初始化时传入，需要从 BM1684X 中断分配表核实后才能写进配置头
-- 已知速率上限：现有驱动写的是 eMMC 最高 100MHz、SD 最高 50MHz；ARM TF-A 引导阶段还有一档"安全模式" 25MHz（bypass 挡），供高速不稳时降级
+- 中断号：现有代码里没有固化具体中断号，靠调用方初始化时传入；仓库里搜不到这个数字（VxWorks 版是从板级 BSP 的 hwconf 配置文件取的，那个文件不在本仓库），需要你从 BM1684X 中断分配表/现有 BSP 配置核实。**不是阻塞项**：引擎层的 OSAL 支持纯轮询模式（不传中断回调即可），可以先用轮询跑通，中断号确认后再切到中断模式提速。
+- 已知速率上限：现有驱动写的是 eMMC 最高 100MHz、SD 最高 50MHz；ARM TF-A 引导阶段还有一档"安全模式" 25MHz（bypass 挡）——本项目驱动初始就用这一档，不挑战高速
 
 ## 目录结构（现状）
-- `vxworks-driver/bm1684xSdhci.c` + `bm1684xSdhciHw.h` + `bm1684xSdhciOsal.h` —— **不依赖任何 RTOS SDK 的自包含命令/数据引擎层**，靠 OSAL 回调表挂接信号量/中断/内存分配，是本次适配天脉3的复用起点，相当于 rk3588 项目里的 `rk_emmc_sdhci.c`
+- `vxworks-driver/bm1684xSdhci.c` + `bm1684xSdhciHw.h` + `bm1684xSdhciOsal.h` —— **不依赖任何 RTOS SDK 的自包含命令/数据引擎层**，靠 OSAL 回调表挂接信号量/中断/内存分配，是本次适配天脉3的复用起点，相当于 rk3588 项目里的 `rk_emmc_sdhci.c`。**已确认其 `bm1684xSdhciInit()` 内部已完成 14 步 PHY 时序初始化**，新写的核心层调用一次即可，无需重复实现。
 - `vxworks-driver/vxbBm1684xSdhci.c` + `vxbBm1684xSdhci.h` —— **完整的 VxWorks7 vxBus 驱动**，挂在 VxWorks 自带 SD/MMC 协议栈下，目标系统是 VxWorks 不是天脉3，本次不直接复用，但寄存器细节和 PHY 时序可以参考
 - `trusted-firmware-a/drivers/bitmain/bm_sd.c`、`trusted-firmware-a/plat/bitmain/bm1684/bm_common.c` —— **ARM TF-A bl2 阶段**的 eMMC 初始化（PHY 时序、时钟分档、标准 `mmc_init()`），决定了天脉3接管 eMMC 时寄存器是什么状态；**只读参考，勿改**
-- （待新建）`vxworks-driver/bm_emmc_core.c` —— 卡初始化序列 + EXT_CSD 容量解析 + 按 LBA 读写整块，类比 rk3588 的 `rk_emmc_core.c`，**目前完全没有这层**
-- （待新建）`vxworks-driver/bm_emmc_glue.c` + 从 rk3588 项目搬来改容量/基址的 `fatBlkDrvDemo_os3.c` —— 对接天脉3自带 FAT，类比 rk3588 的 glue 层，**目前完全没有这层**
-- （待新建）配置头，类比 rk3588 的 `rk_emmc_glue_cfg.h` / `rk_emmc.h` —— 驱动总开关宏、可调时钟/总线宽度参数集中存放
+- `vxworks-driver/bm_emmc_core.c` —— **已新建**：卡初始化序列 + EXT_CSD 容量解析 + 按 LBA 读写整块，类比 rk3588 的 `rk_emmc_core.c`
+- `vxworks-driver/bm_emmc_osal_os3.c` / `.h` —— **已新建**：天脉3 对接 `bm1684xSdhci.c` 引擎层的 OSAL 回调（iomap/udelay/mem_alloc/mem_free；sem/irq 留空走轮询，rk3588 项目没有这一层，因为它的底层是从零写的寄存器驱动没有 OSAL 抽象）
+- `vxworks-driver/bm_emmc_glue.c` + 从 rk3588 项目搬来改容量函数名的 `fatBlkDrvDemo_os3.c` —— **已新建**：对接天脉3自带 FAT，类比 rk3588 的 glue 层
+- `vxworks-driver/bm_emmc_glue_cfg.h` / `bm_emmc.h` / `bm_emmc_types.h` —— **已新建**：驱动总开关宏 `BM1684X_EMMC`、可调时钟/总线宽度参数、基础类型，类比 rk3588 的 `rk_emmc_glue_cfg.h` / `rk_emmc.h` / `rk_emmc_types.h`
+- `vxworks-driver/README_BM1684X_eMMC_天脉3适配说明.md` —— **已新建**：集成步骤、可调参数、上板验证步骤、关键假设
 
-## 装载接缝（目标态，多数节点待写）
+## 装载接缝（已落地）
 ```
-天脉FAT(open/read/write) → fatBlkDrvDemo_os3.c（从rk3588项目搬运改容量/基址）
+天脉FAT(open/read/write) → fatBlkDrvDemo_os3.c（从rk3588项目搬运改容量函数名）
   → blkDevRd/Wrt
-  → bm_emmc_rd_sect0_2 / bm_emmc_wr_sect0_2   (待新建 bm_emmc_glue.c ← 真正的替换点)
-  → bm_emmc_read_blocks / bm_emmc_write_blocks (待新建 bm_emmc_core.c：卡初始化+EXT_CSD+LBA读写)
-  → bm1684xSdhciSendCmd() 命令/数据引擎        (已有 vxworks-driver/bm1684xSdhci.c)
+  → emmc_rd_sect0_2 / emmc_wr_sect0_2   (bm_emmc_glue.c ← 真正的替换点)
+  → bm_emmc_read_blocks / bm_emmc_write_blocks (bm_emmc_core.c：卡初始化+EXT_CSD+LBA读写)
+  → bm1684xSdhciSendCmd() 命令/数据引擎        (已有 vxworks-driver/bm1684xSdhci.c，内含 PHY 初始化)
   → SDHCI 寄存器 0x50100000
 ```
-现状是只有**最底下这一段（引擎层）**和**最上面这一段（天脉自带FAT，跟RK3588项目共用）**，中间两层（卡初始化/容量探测、对接天脉块设备）都是空的，这是当前最大的缺口。
+中间两层（卡初始化/容量探测、对接天脉块设备）已补齐，详见 `vxworks-driver/README_BM1684X_eMMC_天脉3适配说明.md`。
 
-## 改动约束（沿用 rk3588 同款思路，待确认是否适用）
-- 编译时是否要排除别的 eMMC/SD 旧实现以免符号冲突——需要先确认天脉3工程模板里有没有自带的 BM1684X eMMC 驱动样板（类似 rk3588 项目里需要排除的复旦微底层）
-- 可调参数（时钟、总线宽度、PIO/DMA 选择）集中放一个头文件，不稳就能直接降参数，不用改散落在各处的代码
+## 改动约束（沿用 rk3588 同款思路）
+- 可调参数（时钟、总线宽度、DMA 地址位宽）集中在 `bm_emmc.h`，不稳就能直接降参数，不用改散落在各处的代码
+- 编译时排除冲突的问题见下面缺口第 1 项，还没确认
 
-## 待核对的核心假设/缺口（启动方式、纯数据盘、PHY 归属、DMA/PIO 已在访谈中拍板，下面是剩余缺口）
-1. **卡初始化与容量探测整层缺失**：无论是 VxWorks 版还是自包含引擎版，现有代码都没有实现 CMD0/CMD1(或CMD8+ACMD41)/CMD2/CMD3/CMD9/CMD7/CMD6 这套 MMC 初始化序列，也没有解析 EXT_CSD 拿 `SEC_COUNT` 容量——VxWorks 版这部分是交给 VxWorks SDK 自带的 SD/MMC 协议栈做的，天脉3没有这套协议栈，必须新写，对应 rk3588 项目的 `rk_emmc_core.c`。这一层还要新增 PHY/时钟初始化（搬 TF-A `bm_emmc_phy_init()` 的 14 步时序），因为已确认引导不会代劳。
-2. **对接天脉 FAT 的 glue 层完全没有**：rk3588 项目里这层（复用 `fatBlkDrvDemo_os3.c` + 新写 `rk_emmc_glue.c`）是把 `blkDevRd/Wrt` 接到驱动的关键缝合点；bootloader-arm64 目前一行都没有，需要从 rk3588 项目把 `fatBlkDrvDemo_os3.c` 模板搬过来改容量/基址。
-3. **DMA 缓冲区的物理连续性 / cache 一致性怎么保证**：已确认走 DMA，但天脉3 这边提供的内存分配接口能不能保证物理连续、cache 是否需要手动维护，目前未知，需要查天脉3 文档或问厂商确认。
-4. **没有总开关宏、没有自检入口、没有集成说明文档**：rk3588 有 `RK3588_EMMC` 总开关、`rk_emmc_selftest(lba)` 自检入口、`README_RK3588_eMMC_天脉3适配说明.md`；bootloader-arm64 目前一个都没有，建完中间两层后要补齐。
-5. **中断号未定**：eMMC 中断号现在靠调用方传入，没有固化的常量，需要从 BM1684X 中断分配表核实后写进配置头。
+## 待核对的核心假设/缺口（核心层、glue 层、配置头/自检/文档已交付源码，剩下两项需要你核实）
+1. **编译时排除冲突**：天脉3 工程模板里有没有自带的 BM1684X eMMC 驱动样板需要排除（类似 rk3588 项目里要排除的复旦微底层，会跟 `bm_emmc_glue.c` 提供的 `AcoreOs_fmsh_sdmmc_init`/`emmc_rd_sect0_2` 等同名符号冲突）——还没确认，需要你打开天脉3 IDE 工程核实。
+2. **中断号未定**：eMMC 中断号现在没有固化常量。**不是阻塞项**：已用 OSAL 的 sem/irq 回调留空让引擎走纯轮询模式跑通；等你核实中断号后，把 `bm_emmc_osal_os3.c` 里的 `irq_connect`/`irq_enable`/`sem_*` 回调接到天脉3 对应 API 即可切到中断模式提速。
+
+## 与本仓库真实 U-Boot/TF-A 代码交叉核对后新发现并已处理的缺口
+对照仓库里真实的 `u-boot/drivers/mmc/sdhci-bitmain.c`、`u-boot/drivers/reset/reset-bitmain.c`、
+`trusted-firmware-a/.../bm_sd.c`/`bm_clock.c` 排查出一处真实缺口：**TOP 域 eMMC 时钟使能
+（+0x800）和软复位（+0xC00 bit20）从未被现有引擎层 `bm1684xSdhci.c` 调用过**——因为 TF-A/
+U-Boot 只在"eMMC 是引导介质"场景下运行，这一步是 BootROM 替它们做的；本项目不从 eMMC 引导，
+没有人补这一步，可能导致控制器寄存器读不通。已在 `bm_emmc_core.c` 新增 `bmTopDomainInit()`
+主动补上（位定义已与 TF-A/U-Boot 三处代码交叉核对一致），并补上了 U-Boot 里设置而引擎层没设
+的 `EMMC_CTRL_R` `CARD_IS_EMMC` 位。另发现引擎层 PHY 延迟线配置（SDCLKDL/ATDL）与 U-Boot 不
+完全一致（引擎层用旁路、U-Boot 用固定延迟/INPSEL），评估为低风险（旁路更保守，且只跑 25MHz
+安全档）暂未处理，记录在案。详见 `vxworks-driver/README_BM1684X_eMMC_天脉3适配说明.md` 第八节。
 
 ## 工作方式约束
 - 本地无法编译天脉3固件（没有天脉3工具链/头文件）：交付源码，由你在天脉 IDE 编译、烧板验证。
-- 你有板可测；后续补齐核心层后，应仿照 rk3588 项目提供一个上板自检入口。
-- 启动方式、纯数据盘、PHY 归属、DMA/PIO 这几项系统设计取舍已访谈确认（见上）；剩下的缺口（核心层、glue 层、配置头/自检/文档）下一步是出具体实现方案，而不是直接开始写代码。
+- 你有板可测；上板自检入口 `bm_emmc_selftest(lba)`。
+- 详细集成与验证步骤见 `vxworks-driver/README_BM1684X_eMMC_天脉3适配说明.md`。
