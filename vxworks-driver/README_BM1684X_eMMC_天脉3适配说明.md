@@ -206,3 +206,13 @@ cache 函数确实做了真正的 clean/invalidate（而不是空壳），其次
 - **尚未验证的假设**（同样需要上板核实）：SD 卡的 CSD 里 `READ_BL_LEN` 字段假设为 512B
   （绝大多数现代卡如此），本版本没有读取该字段做特殊适配，遇到块长不是 512 的老卡会算错容量；
   CMD8 超时（老的 SD 1.x 卡）路径写了但未实测，理论上会回退到字节寻址，不保证所有老卡都兼容。
+- **上板实测反馈并已修复的真实缺口**：第一版插着卡仍报 `init fail -5`（`BM_SD_ENOCARD`，
+  卡检测不到）。交叉核对 `u-boot/drivers/mmc/sdhci.c` 后发现：BM1684X 平台的 SD 卡槛除了
+  SDHCI 标准的 `POWER_CONTROL` 寄存器外，**还有一个独立的板级供电开关 GPIO**（即设备树
+  `sdhc@50101000` 节点的 `pwr-gpio = <&port1a 10 GPIO_ACTIVE_HIGH>;`，对应 u-boot
+  `sdhci_init()`/`sdhci_set_power()` 里裸写 `BM_PORTB_BASE(0x50027400)+0x0/+0x4/+0x8`、
+  bit10 的那段代码，名字叫 `SDIO_PWR_EN`/GPIO42）。没驱动这个 GPIO，卡槛物理上完全没电，
+  插着卡控制器也检测不到——这是 eMMC 版本没有的步骤（eMMC 焊死供电，不需要开关），第一版
+  照搬 eMMC 思路时漏掉了。已在 `bm_sd_core.c` 新增 `bmSdPwrGpioInit()`，在 `bm_sd_init()`
+  最前面（TOP 域时钟之后、引擎初始化之前）按 u-boot 的寄存器序列原样补上：选软件模式
+  （+0x8 清 bit10）→ 设输出方向（+0x4 置 bit10）→ 驱动高电平上电（+0x0 置 bit10）。

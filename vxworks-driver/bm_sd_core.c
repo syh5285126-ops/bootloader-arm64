@@ -24,6 +24,13 @@
  * TOP 域时钟使能/软复位、EMMC_CTRL_R 厂商位、DMA cache 维护这几块和 eMMC
  * 版本的处理思路相同（见 bm_emmc_core.c 顶部注释），不再重复展开，仅在下面
  * 对应位置注明与 SD 通道（devIndex=1，基址 0x50101000）相关的差异点。
+ *
+ * 【上板实测反馈的真实缺口，已修复】SD 卡槛有一个独立于 SDHCI 标准寄存器之外
+ * 的供电开关 GPIO（SDIO_PWR_EN，port1a bit10，对照设备树 pwr-gpio 属性和
+ * u-boot drivers/mmc/sdhci.c 里 sdhci_init()/sdhci_set_power() 的裸寄存器
+ * 写法），eMMC 版本没有这个东西（eMMC 焊死供电不需要开关）。第一版漏了这步，
+ * 导致卡槛没电、插着卡也检测不到（bm1684xSdhciCardPresent() 报
+ * BM_SD_ENOCARD），见下面 bmSdPwrGpioInit()。
  ******************************************************************************/
 #include "bm_sd_glue_cfg.h"
 #ifdef BM1684X_SD
@@ -117,6 +124,44 @@ static void bmSdTopDomainInit(void)
 }
 
 /*--------------------------------------------------------------------------
+ * SD 卡槛供电开关 GPIO（SDIO_PWR_EN，对照 dts `sdhc@50101000` 节点的
+ * `pwr-gpio = <&port1a 10 GPIO_ACTIVE_HIGH>;` 属性，端口基址即 u-boot
+ * include/configs/bitmain_bm1684.h 里的 BM_PORTB_BASE=0x50027400）。
+ *
+ * 这是板级一个独立于 SDHCI 标准寄存器之外的负载开关：不驱动它，卡槛物理上
+ * 就没有供电，插着卡也检测不到（之前漏了这一步，是 bm1684xSdhciCardPresent()
+ * 报 BM_SD_ENOCARD 的真正原因）。u-boot 在两处分别处理：
+ *   - drivers/mmc/sdhci.c sdhci_init()：探测时选软件模式 + 设为输出方向
+ *     （+0x8 清 bit10，+0x4 置 bit10）；
+ *   - drivers/mmc/sdhci.c sdhci_set_power()：实际上电时驱动高电平
+ *     （+0x0 置 bit10）。
+ * 本函数按"细节以 uboot 为准"原样合并这两步（天脉3 没有 DM_GPIO 框架，直接
+ * 按 u-boot 里 !DM_GPIO 分支的裸寄存器写法照搬）。
+ *------------------------------------------------------------------------*/
+#define BM1684X_SD_PWR_GPIO_BASE   0x50027400UL   /* port1a 控制器基址，u-boot BM_PORTB_BASE */
+#define BM1684X_SD_PWR_GPIO_BIT    (1U << 10)      /* SDIO_PWR_EN，对应 GPIO42 */
+
+static void bmSdPwrGpioInit(void)
+{
+    volatile u32 *pSwMode = (volatile u32 *)(BM1684X_SD_PWR_GPIO_BASE + 0x8U);
+    volatile u32 *pDir    = (volatile u32 *)(BM1684X_SD_PWR_GPIO_BASE + 0x4U);
+    volatile u32 *pData   = (volatile u32 *)(BM1684X_SD_PWR_GPIO_BASE + 0x0U);
+
+    /* 选软件模式（对照 u-boot sdhci_init() 里 +0x8 那行：清 bit10） */
+    *pSwMode &= ~BM1684X_SD_PWR_GPIO_BIT;
+    BM_DSB();
+
+    /* 设为输出方向（对照 +0x4 那行：置 bit10） */
+    *pDir |= BM1684X_SD_PWR_GPIO_BIT;
+    BM_DSB();
+
+    /* 驱动高电平给卡槛上电（对照 sdhci_set_power() 里 +0x0 那行：置 bit10） */
+    *pData |= BM1684X_SD_PWR_GPIO_BIT;
+    BM_DSB();
+    delay_us(10000);   /* 给卡槛供电稳定留余量，求稳优先 */
+}
+
+/*--------------------------------------------------------------------------
  * 等待卡回到可用状态（CMD13 轮询），逻辑与 eMMC 版本一致，SD/eMMC 共用同一套
  * 卡状态机定义（JEDEC/SD 协会两份规范这一段是一致的）。
  *------------------------------------------------------------------------*/
@@ -199,6 +244,10 @@ int bm_sd_init(void)
 
     /* 先把 TOP 域 SD 时钟/复位打开，再让引擎层去碰控制器寄存器 */
     bmSdTopDomainInit();
+
+    /* 给卡槛供电（SDIO_PWR_EN GPIO）。必须在引擎初始化/卡检测之前做，否则
+     * 卡槛没电，bm1684xSdhciCardPresent() 即使插着卡也会返回"不在位"。*/
+    bmSdPwrGpioInit();
 
     /* 引擎初始化：内部完成 14 步 PHY 时序 + 控制器复位上电 + 识别时钟（200kHz）。
      * devIndex 传 BM1684X_SD_INDEX(=1)，base 传 SD 控制器基址 0x50101000——

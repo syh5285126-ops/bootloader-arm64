@@ -124,4 +124,11 @@ eMMC 读写一直未成功（`write fail -1`，解码后 `BM_ERR_HW` 对应真�
 - 上板自检入口：`bm_sd_selftest(lba)`（`bm_sd_glue.c` 里）。
 - 尚未验证的假设：SD 卡 CSD 的 `READ_BL_LEN` 假设为 512B（没做特殊适配）；CMD8 超时（老 SD
   1.x 卡）的回退路径写了但未实测。
+- **上板实测反馈并已修复**：插着卡仍报 `init fail -5`（`BM_SD_ENOCARD`）。根因是 BM1684X
+  的 SD 卡槛除了 SDHCI 标准供电寄存器外，还有一个独立的板级供电开关 GPIO（`SDIO_PWR_EN`，
+  对照设备树 `pwr-gpio = <&port1a 10>` 与 `u-boot/drivers/mmc/sdhci.c` 的
+  `sdhci_init()`/`sdhci_set_power()`，寄存器基址 `0x50027400` bit10）——没驱动它卡槛
+  根本没电，eMMC 版本没这一步（焊死供电不用开关），第一版照搬时漏掉了。已在
+  `bm_sd_core.c` 新增 `bmSdPwrGpioInit()`，在 `bm_sd_init()` 最前面按 u-boot 寄存器序列
+  原样补上。
 - 详见 `vxworks-driver/README_BM1684X_eMMC_天脉3适配说明.md` 第十节。
