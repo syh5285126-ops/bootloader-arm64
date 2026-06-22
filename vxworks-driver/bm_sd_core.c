@@ -36,6 +36,7 @@
 #ifdef BM1684X_SD
 
 #include <string.h>
+#include <stdio.h>
 #include "bm_sd.h"
 #include "bm1684xSdhciOsal.h"
 #include "bm1684xSdhciHw.h"
@@ -259,13 +260,27 @@ int bm_sd_init(void)
     if (g_dev == NULL)
         return BM_SD_EIO;
 
-    /* 卡检测：SD 卡可插拔，初始化前先确认卡在位。对照 u-boot bm_get_cd()：
-     * SD 通道读真实的卡检测/Present 状态位（不像 eMMC 那样硬编码常在位），
-     * 探测到后还会显式置位 SDHCI_POWER_CONTROL 的 POWER_ON——这一步已经在
-     * bm1684xSdhciInit() 内部的 hwInit() 里对任意 devIndex 都做了（3.3V
-     * 上电是控制器初始化的固定步骤，不分 eMMC/SD），本文件不需要重复。*/
-    if (!bm1684xSdhciCardPresent(g_dev))
-        return BM_SD_ENOCARD;
+    /* 卡检测（软检测）：
+     * 本应在此确认卡在位再继续。但上板实测发现：明明插着卡，SDHCI 的"卡在位"
+     * 状态位（Present State bit16）始终读不到 1，导致这里直接返回 init fail -5。
+     * 可能原因：本板的卡检测(CD#)信号没接到控制器、或控制器全复位后该位的消抖
+     * 还没完成、或该引脚复用未到位。既然卡是确实插着的，硬卡在这一位上没有意义。
+     *
+     * 因此改成"软检测"：先轮询一小段时间给消抖留机会；若仍读不到，打印一条告警
+     * 后【继续往下走】识别流程，不再直接返回 ENOCARD。这样做是安全的——引擎层
+     * 发命令有 1s 超时保护，真要是没卡/没电，后续 CMD55/ACMD41 会超时返回别的
+     * 错误码（比死活停在 -5 更能定位真正的卡点）。*/
+    {
+        int present = 0;
+        u32 i;
+        for (i = 0; i < 200U; i++) {          /* 最多约 1s，每次 5ms */
+            if (bm1684xSdhciCardPresent(g_dev)) { present = 1; break; }
+            delay_us(5000);
+        }
+        if (!present)
+            printf("[bm_sd] WARN: 卡在位状态位读不到(可能CD线未接/消抖未完成)，"
+                   "仍继续初始化；若实际无卡，后续命令会超时报错\r\n");
+    }
 
     /* 置位 EMMC_CTRL_R 的 bit0（厂商区 +0x2C）。命名是 CARD_IS_EMMC，但对照
      * u-boot sdhci-bitmain.c 的 bm_sdhci_probe()：这一位是【不分 index、对
