@@ -156,3 +156,53 @@ cache 函数确实做了真正的 clean/invalidate（而不是空壳），其次
 - 后续如需提速：确认中断号后切中断模式（减少 CPU 占用）；确认时序余量后可尝试调高
   `BM_EMMC_TRAN_CLK_HZ`（但引擎层未实现 HS_TIMING 切换，无脑提频有失败风险，需先确认是否要
   补这部分代码）。
+
+## 十、SD 卡驱动版本（`bm_sd_*`，本次新增）
+
+因 eMMC 读写一直未跑通（排查中），用户要求新增一套**SD 卡版本**的驱动，作为另一条独立验证
+路径，方便用插拔方便、问题更容易隔离的 SD 卡来判断"是引擎层/控制器本身有问题"还是"eMMC 这
+颗卡/这条信号链路有问题"。与原 eMMC 版本的关系：
+
+- **二者二选一编译，不能同时打开**：`bm_sd_glue.c` 与 `bm_emmc_glue.c` 提供的符号名【完全
+  相同】（`AcoreOs_fmsh_sdmmc_init`/`emmc_rd_sect0_2`/`emmc_wr_sect0_2`/`bm_emmc_get_block_count`
+  等），这是有意设计成的——这样 `fatBlkDrvDemo_os3.c` 不用改一行代码，换底层介质时直接在天脉
+  IDE 工程里切换参与编译的文件组即可。详细二选一说明见 `bm_sd_glue_cfg.h` 顶部注释。
+- **协议时序的依据不同**：原 eMMC 版本是"照搬 rk3588 项目的思路，细节按 JEDEC eMMC 规范自己
+  写"；本 SD 版本按用户明确要求**逐条照搬 U-Boot 通用协议层** `u-boot/drivers/mmc/mmc.c`
+  里 SD 专属的函数改写（`mmc_go_idle`/`mmc_send_if_cond`/`sd_send_op_cond`/`mmc_startup`
+  的 SD 分支/`sd_select_bus_width`），命令参数、响应类型、CSD 容量解析公式都与这几个函数
+  逐行对照过。
+- **新增文件**（均在 `vxworks-driver/`，与 eMMC 版本一一对应）：
+  - `bm_sd_core.c` —— SD 卡协议层：CMD0/CMD8(SEND_IF_COND)/CMD55+ACMD41(SD_SEND_OP_COND)/
+    CMD2/CMD3(卡自报 RCA)/CMD9(CSD 解析容量)/CMD7/CMD55+ACMD6(切4位总线)，按 LBA 读写整块；
+    类比 `bm_emmc_core.c`。
+  - `bm_sd_glue.c` —— 对接天脉3 FAT 的桥接层，符号名与 `bm_emmc_glue.c` 相同（见上）；
+    类比 `bm_emmc_glue.c`。
+  - `bm_sd_osal_os3.c`/`.h` —— OSAL 回调表，内容与 `bm_emmc_osal_os3.c` 完全一致，只是换了
+    导出符号名（`g_bm1684xOsalOs3Sd`）避免重复定义；类比 `bm_emmc_osal_os3.c`/`.h`。
+  - `bm_sd.h`/`bm_sd_types.h`/`bm_sd_glue_cfg.h` —— 对外接口/基础类型/总开关宏
+    `BM1684X_SD`；类比 `bm_emmc.h`/`bm_emmc_types.h`/`bm_emmc_glue_cfg.h`。
+- **与 eMMC 版本的实质性差异**（均为 SD 协议本身的规则，不是本项目自创）：
+  1. 没有 CMD1，识别态走 **CMD8 + ACMD41**（不是 CMD1 OCR 轮询）；
+  2. **RCA 由卡自己上报**（CMD3 响应里取），不是主机指定固定值；
+  3. **容量来自 CMD9 的 CSD 寄存器**（按 U-Boot 公式解析），SD 卡没有 EXT_CSD；
+  4. 总线位宽切换用 **ACMD6**（标准命令），不是 eMMC 的 CMD6 改 EXT_CSD 字段；
+  5. **SD 卡可插拔**，初始化前先用 `bm1684xSdhciCardPresent()` 查卡在位，查不到卡返回新增的
+     `BM_SD_ENOCARD`；eMMC 焊死在板上没有这一步。
+  6. 控制器/PHY 层走的是引擎层 `bm1684xSdhci.c` 里 `devIndex==BM1684X_SD_INDEX(=1)` 的分支
+     （基址 0x50101000，PHY 的 SMPLDL 配置等已按 U-Boot `bm_sdhci_phy_init()` 的 SD 分支
+     原样实现，本次未改），这部分引擎层早就支持，无需新写代码。
+- **核对 U-Boot 源码时发现并已照办的一个细节**：`u-boot/drivers/mmc/sdhci-bitmain.c` 的
+  `bm_sdhci_probe()` 里，`EMMC_CTRL_R` 寄存器 bit0（命名是 `CARD_IS_EMMC`）是**不分
+  `host->index`、对任何使用这份驱动的设备都无条件置位**的，SD/SDIO 通道也一样设置——名字
+  看起来像"只给 eMMC 用"，但 U-Boot 实际代码并没有按名字这么做。本 SD 版本按"具体细节以
+  U-Boot 为准"的要求，在 `bm_sd_core.c` 里原样替 SD 通道也补上了这一位（已在文件内注释处
+  说明依据）。这是一个**命名和行为不一致**的真实细节，留痕方便后续核对。
+- **沿用 eMMC 版本未变的部分**：TOP 域时钟使能/软复位手法（只是换成 SD 对应的位定义
+  `BM1684X_CLK_AXI_SD`/`BM1684X_RST_SD` 等）、DMA cache 维护时序、`先求稳`参数默认值
+  （25MHz、4位总线、轮询模式），原因和注意事项都与第八/九节一致，不再重复。
+- **上板自检入口**：`bm_sd_selftest(lba)`（在 `bm_sd_glue.c` 里），用法和打印格式与
+  `bm_emmc_selftest()` 一致。
+- **尚未验证的假设**（同样需要上板核实）：SD 卡的 CSD 里 `READ_BL_LEN` 字段假设为 512B
+  （绝大多数现代卡如此），本版本没有读取该字段做特殊适配，遇到块长不是 512 的老卡会算错容量；
+  CMD8 超时（老的 SD 1.x 卡）路径写了但未实测，理论上会回退到字节寻址，不保证所有老卡都兼容。

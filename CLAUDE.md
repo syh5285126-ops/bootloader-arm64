@@ -93,3 +93,35 @@ U-Boot 只在"eMMC 是引导介质"场景下运行，这一步是 BootROM 替它
 - 本地无法编译天脉3固件（没有天脉3工具链/头文件）：交付源码，由你在天脉 IDE 编译、烧板验证。
 - 你有板可测；上板自检入口 `bm_emmc_selftest(lba)`。
 - 详细集成与验证步骤见 `vxworks-driver/README_BM1684X_eMMC_天脉3适配说明.md`。
+
+## eMMC 排障现状（未解决，已切到 SD 卡验证）
+eMMC 读写一直未成功（`write fail -1`，解码后 `BM_ERR_HW` 对应真实根因是 ERR_INT_STATUS bit0
+"Command Timeout Error"；用户回复读也不正常，从未成功写进过），根因还没定位，排障被用户暂时
+搁置（"先不纠结这个"），转而要求新增 SD 卡版本驱动作为另一条独立验证路径。**eMMC 这条线没有
+被放弃，只是暂停**，后续回头排查时建议先确认 `bm_emmc_init()` 本身是否成功（selftest 有没有
+打印出容量数字，还是直接 "init fail"）。
+
+## 新增：SD 卡驱动版本（`bm_sd_*`，与 eMMC 版本二选一编译）
+用户要求"把驱动改为 SD 卡的驱动，具体细节以 uboot 为准"——这次不再是"只照搬思路"，是**逐条
+照搬** `u-boot/drivers/mmc/mmc.c` 里 SD 专属协议函数（`mmc_go_idle`/`mmc_send_if_cond`/
+`sd_send_op_cond`/`mmc_startup` 的 SD 分支/`sd_select_bus_width`）改写卡识别时序。
+- 新增文件（`vxworks-driver/`，与 eMMC 版本一一对应）：`bm_sd_core.c`、`bm_sd_glue.c`、
+  `bm_sd_osal_os3.c/.h`、`bm_sd.h`、`bm_sd_types.h`、`bm_sd_glue_cfg.h`（总开关宏
+  `BM1684X_SD`）。
+- **`bm_sd_glue.c` 与 `bm_emmc_glue.c` 提供的符号名完全相同**（`AcoreOs_fmsh_sdmmc_init`/
+  `emmc_rd_sect0_2`/`bm_emmc_get_block_count` 等），让 `fatBlkDrvDemo_os3.c` 不改代码即可
+  切换底层介质——但这意味着**两套文件不能同时参与编译**，二选一时另一套要在天脉 IDE 工程里
+  排除掉。
+- 与 eMMC 版本的实质性差异（SD 协议本身的规则）：CMD8+ACMD41 取代 CMD1；RCA 由卡自己上报
+  （不是主机指定）；容量来自 CMD9 的 CSD 寄存器解析（SD 没有 EXT_CSD）；总线位宽切换用
+  ACMD6；SD 卡可插拔，初始化前用 `bm1684xSdhciCardPresent()` 查卡在位（查不到返回新增的
+  `BM_SD_ENOCARD`）。控制器/PHY 层走引擎层 `bm1684xSdhci.c` 里 `devIndex==1` 的现成 SD 分支，
+  未改引擎层代码。
+- **核对 U-Boot 时发现的命名陷阱**：`sdhci-bitmain.c` 的 `bm_sdhci_probe()` 给
+  `EMMC_CTRL_R` bit0（命名 `CARD_IS_EMMC`）置位是**不分 index、无条件对所有设备执行**的，
+  SD 通道也一样设置——名字带"EMMC"但 U-Boot 真实代码并不只给 eMMC 设。按"细节以 uboot 为准"
+  的要求，`bm_sd_core.c` 里照样替 SD 通道补了这一位，并在代码注释里记录了这个名实不一致的点。
+- 上板自检入口：`bm_sd_selftest(lba)`（`bm_sd_glue.c` 里）。
+- 尚未验证的假设：SD 卡 CSD 的 `READ_BL_LEN` 假设为 512B（没做特殊适配）；CMD8 超时（老 SD
+  1.x 卡）的回退路径写了但未实测。
+- 详见 `vxworks-driver/README_BM1684X_eMMC_天脉3适配说明.md` 第十节。
