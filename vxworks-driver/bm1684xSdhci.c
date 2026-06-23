@@ -23,6 +23,13 @@
 #define SDHCI_CMD_TIMEOUT_MS    1000U
 #define SDHCI_XFER_TIMEOUT_MS   5000U
 #define SDHCI_RESET_TIMEOUT_US  100000U
+/* 发命令前等 CMD/DAT 忙位清除的超时上限。对照 u-boot drivers/mmc/sdhci.c
+ * 的 sdhci_send_command()：它从 SDHCI_CMD_DEFAULT_TIMEOUT(100ms) 起步、超时
+ * 翻倍重试直到 SDHCI_CMD_MAX_TIMEOUT(3200ms) 才放弃（本芯片参考驱动 bm_sd.c
+ * 则干脆无限等）。带数据的命令在卡"编程忙"时等的就是这个 DAT 忙位，给足
+ * 余量取 u-boot 放弃前的等待总量 3.2s，避免给太短误判超时；正常情况忙位
+ * 很快清除，几乎不增加耗时。 */
+#define SDHCI_INHIBIT_TIMEOUT_US 3200000U
 #define SDHCI_CLK_STABLE_US     150U
 #define SDHCI_PHY_RESET_US      20U
 #define SDHCI_MAX_DIVIDER       256U
@@ -160,53 +167,59 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
     phyCnfg = (0x9U << PHY_CNFG_PAD_SP) | (0x8U << PHY_CNFG_PAD_SN);
     REG_WR32(pDev->base, SDHCI_P_PHY_CNFG, phyCnfg);
 
-    /* 3. CMD pad: RXSEL=1, WEAKPULL_EN=1, TXSLEW_CTRL_P=0xA, TXSLEW_CTRL_N=6 */
+    /* 3. CMD pad: RXSEL=2, WEAKPULL_EN=1, TXSLEW_CTRL_P=0x3, TXSLEW_CTRL_N=2
+     * （数值已对照本仓库 trusted-firmware-a/drivers/bitmain/bm_sd.c 的
+     * bm_sd_phy_init()/bm_emmc_phy_init() 改正——之前这里的 RXSEL=1、
+     * TXSLEW=0xA/6 跟 TF-A 两个真实实现都不一致，疑似当年写错的固定值，
+     * TF-A 对 eMMC/SD 这几个 pad 电气参数用的是同一组数值） */
     REG_WR16(pDev->base, SDHCI_P_CMDPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (1U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (0x3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
     /* 4. DAT pad: same as CMD */
     REG_WR16(pDev->base, SDHCI_P_DATPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (1U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (0x3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 5. CLK pad: RXSEL=0, WEAKPULL_EN=0, TXSLEW_CTRL_P=0xA, TXSLEW_CTRL_N=6 */
+    /* 5. CLK pad: RXSEL=2, WEAKPULL_EN=0, TXSLEW_CTRL_P=0x3, TXSLEW_CTRL_N=2 */
     REG_WR16(pDev->base, SDHCI_P_CLKPAD_CNFG,
              (unsigned short)(
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (2U << PAD_CNFG_RXSEL) |
+                 (0x3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 6. STB pad: RXSEL=1, WEAKPULL_EN=2 (pull-down), same slew */
+    /* 6. STB pad: RXSEL=2, WEAKPULL_EN=2 (pull-down), same slew */
     REG_WR16(pDev->base, SDHCI_P_STBPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (2U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (0x3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 7. RST_N pad: RXSEL=1, WEAKPULL_EN=1, same slew */
+    /* 7. RST_N pad: RXSEL=2, WEAKPULL_EN=1, same slew */
     REG_WR16(pDev->base, SDHCI_P_RSTNPAD_CNFG,
              (unsigned short)(
-                 (1U << PAD_CNFG_RXSEL) |
+                 (2U << PAD_CNFG_RXSEL) |
                  (1U << PAD_CNFG_WEAKPULL_EN) |
-                 (0xAU << PAD_CNFG_TXSLEW_CTRL_P) |
-                 (6U  << PAD_CNFG_TXSLEW_CTRL_N)));
+                 (0x3U << PAD_CNFG_TXSLEW_CTRL_P) |
+                 (2U  << PAD_CNFG_TXSLEW_CTRL_N)));
 
-    /* 8. COMMDL: bypass disabled */
+    /* 8. COMMDL: bypass disabled（TF-A 没有动这个寄存器，保持原样不算冲突） */
     REG_WR8(pDev->base, SDHCI_P_COMMDL_CNFG, 0);
 
-    /* 9. SDCLKDL: bypass enabled, DC = 0x0A */
+    /* 9. SDCLKDL：改成 TF-A 的"固定延迟"模式（EXTDLY_EN），不是旁路。
+     * 之前这里用 BYPASS_EN，跟 TF-A eMMC/SD 两条路径都不一致。 */
     REG_WR8(pDev->base, SDHCI_P_SDCLKDL_CNFG,
-            (unsigned char)(1U << SDCLKDL_BYPASS_EN));
+            (unsigned char)(1U << SDCLKDL_EXTDLY_EN));
     REG_WR8(pDev->base, SDHCI_P_SDCLKDL_DC, SDCLKDL_DC_DEFAULT);
 
-    /* 10. SMPLDL: eMMC uses INPSEL=0x2; SD uses BYPASS */
+    /* 10. SMPLDL: eMMC 用 INPSEL=0x2，SD 用 BYPASS——这条原来就跟 TF-A 一致，未改 */
     if (pDev->devIndex == BM1684X_EMMC_INDEX)
         REG_WR8(pDev->base, SDHCI_P_SMPLDL_CNFG,
                 (unsigned char)(0x2U << SMPLDL_INPSEL_CNFG));
@@ -214,9 +227,10 @@ static void phyInit(struct BM1684X_SDHCI_DEV *pDev)
         REG_WR8(pDev->base, SDHCI_P_SMPLDL_CNFG,
                 (unsigned char)(1U << SMPLDL_BYPASS_EN));
 
-    /* 11. ATDL: bypass */
+    /* 11. ATDL：改成 TF-A 的 INPSEL=2，不是旁路（eMMC/SD 在 TF-A 里这条也是
+     * 同一个值，之前这里用 BYPASS_EN 跟两条路径都不一致）。 */
     REG_WR8(pDev->base, SDHCI_P_ATDL_CNFG,
-            (unsigned char)(1U << ATDL_BYPASS_EN));
+            (unsigned char)(2U << ATDL_INPSEL_CNFG));
 
     /* 12. Release PHY reset */
     phyCnfg = REG_RD32(pDev->base, SDHCI_P_PHY_CNFG);
@@ -260,6 +274,15 @@ static int hwInit(struct BM1684X_SDHCI_DEV *pDev)
     /* Power on: 3.3 V */
     REG_WR8(pDev->base, SDHCI_POWER_CONTROL,
             (unsigned char)(SDHCI_POWER_ON | SDHCI_POWER_330));
+
+    /* 数据超时门限：取寄存器允许的最大值 0x0E（TMCLK 下最长的超时周期数），
+     * 跟参考驱动 bm_sd.c（每次发数据命令前都写 0x0E）、以及本仓库现成的
+     * vxbBm1684xSdhci.c（VxWorks 版，bm1684xSdhciHwInit() 里同样写 0x0E）
+     * 三处一致。之前这里完全没碰这个寄存器，复位默认值未知，万一默认值偏小，
+     * 数据阶段稍有延迟控制器就会先报"Data Timeout Error"——取最大值排除这个
+     * 干扰，不会有副作用（只是把硬件自己的超时检测放宽，host 侧轮询仍有自己
+     * 的超时保护）。 */
+    REG_WR8(pDev->base, SDHCI_TIMEOUT_CONTROL, 0x0EU);
 
     /* Enable all normal + error status bits (masked from signalling) */
     REG_WR16(pDev->base, SDHCI_INT_STATUS_EN,
@@ -395,11 +418,23 @@ static unsigned short buildCmdFlags(const BM1684X_MMC_CMD *pCmd,
 
 static unsigned short buildXferMode(const BM1684X_MMC_DATA *pData)
 {
-    unsigned short mode = SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN;
+    /* 传输模式口径对照【本芯片专用、已跑通】的参考驱动 bm_sd.c
+     * （bm_sd_send_cmd_with_data 第 88~99 行）：它对读(CMD17/18)和写(CMD24/25)
+     * 【一律带上 TRNS_MULTI】，连单块也带，靠 BLK_CNT_EN + 块数寄存器=1 来界定
+     * 只传一块；并且【从不用 AUTO_CMD12】。
+     * 注意：这一点与 u-boot 通用 sdhci.c 不一致（u-boot 只在块数>1 时才置
+     * MULTI）。本项目其余细节遵循"以 u-boot 为准"，但这条是 BM1684X 这颗
+     * Synopsys/比特大陆控制器的硬件特性：单块模式(MULTI=0)下写命令做完数据后，
+     * 卡进入"编程忙"，控制器的 DAT 忙位疑似清不干净——表现为单块写之后 DAT
+     * 一直占用，紧跟的命令(CMD13/CMD17)发不出去而超时（读因为没有写后编程忙，
+     * 单块也能过，所以之前"读好了写不行"的不对称正好对得上）。参考驱动用
+     * "一律 MULTI"绕开了这个单块模式的坑。这里照搬参考驱动，单块也置 MULTI；
+     * AUTO_CMD12 仅在真正多块时才用（比参考驱动更省一条显式 CMD12，对单块无
+     * 影响）。 */
+    unsigned short mode = SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI;
 
-    if (pData->blkCount > 1U) {
-        mode |= SDHCI_TRNS_MULTI | SDHCI_TRNS_AUTO_CMD12;
-    }
+    if (pData->blkCount > 1U)
+        mode |= SDHCI_TRNS_AUTO_CMD12;
     if (pData->flags & BM1684X_DATA_READ)
         mode |= SDHCI_TRNS_READ;
 
@@ -438,10 +473,19 @@ void bm1684xSdhciIsr(BM1684X_SDHCI_DEV *pDev)
     pDev->isrStatus = sts | (errSts ? (unsigned int)SDHCI_INT_ERROR : 0U);
     pDev->isrErrSts = errSts;
 
-    /* SDMA boundary: reload DMA address to resume scatter */
+    /* SDMA boundary: reload DMA address to resume scatter。
+     * V4模式下真正的地址寄存器是 ADMA_SA_LOW（见 bm1684xSdhciSendCmd() 里
+     * 的同一处根因说明），SDHCI_DMA_ADDRESS 此时已被复用成块计数寄存器，
+     * 不能再读它当地址重新写回去。 */
     if (sts & SDHCI_INT_DMA_END) {
-        unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
-        REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+        unsigned short hc2reg = REG_RD16(pDev->base, SDHCI_HOST_CONTROL2);
+        if (hc2reg & SDHCI_HC2_VER4_ENABLE) {
+            unsigned int sa = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
+            REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW, sa);
+        } else {
+            unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
+            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+        }
     }
 
     /* Signal waiting thread */
@@ -471,14 +515,28 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
 
     if (!pDev || !pCmd) return BM_ERR_BADARG;
 
-    /* Wait for CMD (and DAT when needed) inhibit to clear */
+    /* 之前这里的注释判断是错的：上次只看了参考驱动 bm_sd_send_cmd_without_data()
+     * 里第一段 "mask = SDHCI_CMD_INHIBIT" 的等待循环，漏看了同一个函数后面单独
+     * 还有一段（第288~294行）：算完 cmd flags 之后，只要 flags != RESP_NONE
+     * （也就是除 CMD0 外的所有命令，CMD13 也在内），还会【再等一次 DAT_INHIBIT
+     * 清除】。也就是说参考驱动的真实规则是"除 CMD0 外所有命令都要等 DAT 忙位
+     * 清除"，不是"只有带数据/R1B忙响应的命令才等"——之前那条"已改回"的结论是
+     * 误读，这里改成跟参考驱动两段等待加起来的真实效果一致：除 CMD0 外都等
+     * CMD_INHIBIT|DAT_INHIBIT。 */
     inhibitMask = SDHCI_STATE_CMD_INHIBIT;
-    if (pData || pCmd->respType == BM1684X_RESP_R1B)
+    if (pCmd->respType != BM1684X_RESP_NONE)
         inhibitMask |= SDHCI_STATE_DAT_INHIBIT;
+
+    /* 发命令前清掉上一条命令残留的中断状态位：参考驱动 bm_sd_send_cmd_with_data()/
+     * bm_sd_send_cmd_without_data() 都是在函数最开头、等忙位之前就清
+     * INT_STATUS/ERR_INT_STATUS=0xFFFF；之前我们把这一步放在等完忙位之后，
+     * 顺序跟参考驱动不一致，这里挪到等待忙位循环之前，跟参考驱动顺序对齐。 */
+    REG_WR16(pDev->base, SDHCI_INT_STATUS, 0xFFFFU);
+    REG_WR16(pDev->base, SDHCI_ERR_INT_STATUS, 0xFFFFU);
 
     {
         unsigned int i;
-        for (i = 0; i < 100000U; i++) {
+        for (i = 0; i < SDHCI_INHIBIT_TIMEOUT_US; i++) {
             if ((REG_RD32(pDev->base, SDHCI_PRESENT_STATE) & inhibitMask) == 0)
                 break;
             if (pDev->osal.udelay) pDev->osal.udelay(1);
@@ -487,20 +545,58 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
             return BM_ERR_TIMEOUT;
     }
 
+    /* 参考驱动每条命令都重写一次超时门限寄存器（不止初始化时写一次）：
+     * sdhciReset() 在命令/数据阶段超时的错误路径里会被调用，复位范围
+     * 可能影响这个寄存器，跟参考驱动一样每条命令都重写一次更保险。 */
+    REG_WR8(pDev->base, SDHCI_TIMEOUT_CONTROL, 0x0EU);
+
     /* Program data registers before writing the command */
     if (pData) {
-        unsigned long dmaAddr = (unsigned long)(unsigned long long)(unsigned long)pData->buf;
+        unsigned long  dmaAddr = (unsigned long)(unsigned long long)(unsigned long)pData->buf;
+        unsigned short hc2reg  = REG_RD16(pDev->base, SDHCI_HOST_CONTROL2);
 
         REG_WR16(pDev->base, SDHCI_BLOCK_SIZE,
                  (unsigned short)SDHCI_MAKE_BLKSZ(7, pData->blkSize));
-        REG_WR16(pDev->base, SDHCI_BLOCK_COUNT,
-                 (unsigned short)(pData->blkCount & 0xFFFFU));
 
-        /* SDMA: write the DMA address (low 32-bit; high written separately if 64-bit) */
-        REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, (unsigned int)(dmaAddr & 0xFFFFFFFFUL));
-        if (pDev->is64Bit)
+        /* 根因排查结论（对照本芯片已跑通的参考驱动 bm_sd_prepare()）：
+         * hwInit() 里始终无条件给 HOST_CONTROL2 置位 HC2_VER4_ENABLE。SDHCI
+         * 规范规定一旦开了这个位，原来在偏移 0x00 的 legacy "SDMA 系统地址"
+         * 寄存器（即 SDHCI_DMA_ADDRESS）就被复用成"32位块计数"寄存器，真正
+         * 的 SDMA 地址要改写到 ADMA_SA_LOW/HIGH（偏移0x58/0x5C）——这正是
+         * CMD24 写命令本身成功、但数据阶段卡死（DAT 忙位再也不清）的根因：
+         * 之前一直按"未开V4"的旧布局写，把真实缓冲区地址写进了被复用成块
+         * 计数的寄存器（解释成块数是个天文数字），而控制器真正用来做 DMA
+         * 的 ADMA_SA_LOW 从未写过、是脏值。这里按 V4 位分支，跟参考驱动
+         * bm_sd_prepare() 的写法保持一致。 */
+        if (hc2reg & SDHCI_HC2_VER4_ENABLE) {
+            REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW,
+                     (unsigned int)(dmaAddr & 0xFFFFFFFFUL));
             REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH,
                      (unsigned int)((dmaAddr >> 32) & 0xFFFFFFFFUL));
+            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, pData->blkCount);
+            REG_WR16(pDev->base, SDHCI_BLOCK_COUNT, 0);
+        } else {
+            REG_WR16(pDev->base, SDHCI_BLOCK_COUNT,
+                     (unsigned short)(pData->blkCount & 0xFFFFU));
+            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS,
+                     (unsigned int)(dmaAddr & 0xFFFFFFFFUL));
+            if (pDev->is64Bit)
+                REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH,
+                         (unsigned int)((dmaAddr >> 32) & 0xFFFFFFFFUL));
+        }
+
+        /* 每次传输前重新选一次 SDMA 模式：对齐参考驱动 bm_sd_prepare()
+         * 末尾的 HOST_CONTROL DMA 选择（它每次传输都做）。hwInit() 里虽然
+         * 已经选过一次、SetBusWidth 也只改总线位宽位不动 DMA 选择位，稳态
+         * 下本来就是 SDMA；但命令/数据阶段超时的错误路径里调过
+         * sdhciReset(CMD|DATA)，保险起见每次传输前按参考驱动重选一遍，只读
+         * 改写 DMA 选择位[4:3]，不动总线位宽位。 */
+        {
+            unsigned char hc1 = REG_RD8(pDev->base, SDHCI_HOST_CONTROL);
+            hc1 = (unsigned char)((hc1 & ~(unsigned char)SDHCI_CTRL_DMA_MASK) |
+                                  (unsigned char)SDHCI_CTRL_SDMA);
+            REG_WR8(pDev->base, SDHCI_HOST_CONTROL, hc1);
+        }
 
         xferMode = buildXferMode(pData);
     }
@@ -596,9 +692,17 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
             return rc;
         }
         if (sts & SDHCI_INT_DMA_END) {
-            /* SDMA 512 KB boundary: reload address to continue */
-            unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
-            REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+            /* SDMA 512 KB boundary: reload address to continue。
+             * V4模式下真正地址在 ADMA_SA_LOW，原因同上（bm1684xSdhciSendCmd()
+             * 里的根因说明）。 */
+            unsigned short hc2reg = REG_RD16(pDev->base, SDHCI_HOST_CONTROL2);
+            if (hc2reg & SDHCI_HC2_VER4_ENABLE) {
+                unsigned int sa = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
+                REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW, sa);
+            } else {
+                unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
+                REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);
+            }
         }
         if (sts & SDHCI_INT_XFER_COMPLETE)
             break;

@@ -31,6 +31,13 @@
  * 写法），eMMC 版本没有这个东西（eMMC 焊死供电不需要开关）。第一版漏了这步，
  * 导致卡槛没电、插着卡也检测不到（bm1684xSdhciCardPresent() 报
  * BM_SD_ENOCARD），见下面 bmSdPwrGpioInit()。
+ *
+ * 【上述修复仍不彻底，第二版补上】光改 GPIO 控制器自己的寄存器不够：对照
+ * u-boot board/bitmain/bm1684/board.c 的 pinmux_config(PINMUX_SDIO) 才发现，
+ * 这颗引脚归不归 GPIO 控制器管，还要先在芯片顶层 pad mux
+ * （PINMUX_BASE+0x28=0x50010428，bit[5:4]）选一下；这一步没做的话，下面对
+ * GPIO 控制器寄存器的读写大概率不会反映到物理引脚上。已在 bmSdPwrGpioInit()
+ * 里补上这第一步，三步合并按 u-boot 真实顺序执行。
  ******************************************************************************/
 #include "bm_sd_glue_cfg.h"
 #ifdef BM1684X_SD
@@ -131,22 +138,42 @@ static void bmSdTopDomainInit(void)
  *
  * 这是板级一个独立于 SDHCI 标准寄存器之外的负载开关：不驱动它，卡槛物理上
  * 就没有供电，插着卡也检测不到（之前漏了这一步，是 bm1684xSdhciCardPresent()
- * 报 BM_SD_ENOCARD 的真正原因）。u-boot 在两处分别处理：
- *   - drivers/mmc/sdhci.c sdhci_init()：探测时选软件模式 + 设为输出方向
- *     （+0x8 清 bit10，+0x4 置 bit10）；
+ * 报 BM_SD_ENOCARD 的真正原因）。u-boot 在三处分别处理，前两版只补了后两处，
+ * 漏了第一处（管脚到底归不归 GPIO 控制器管的"门"），结果就是即便后面 GPIO
+ * 寄存器全部按顺序写对了，物理引脚也可能压根没被路由到 GPIO 控制器上，写了
+ * 等于没写：
+ *   - 【这版新补的第一处】board/bitmain/bm1684/board.c pinmux_config()
+ *     的 PINMUX_SDIO 分支：芯片顶层"引脚到底归哪个功能模块管"的选择
+ *     （pad mux），地址是 PINMUX_BASE(=TOP_BASE+0x400=0x50010400)+0x28，
+ *     bit[5:4] 写 0x1 ——选中"此引脚归 GPIO 管"，必须排在下面 GPIO controller
+ *     自己的寄存器之前，否则 GPIO controller 的输出根本到不了芯片引脚上；
+ *   - drivers/mmc/sdhci.c sdhci_init()：GPIO controller 内部选软件模式 +
+ *     设为输出方向（+0x8 清 bit10，+0x4 置 bit10）；
  *   - drivers/mmc/sdhci.c sdhci_set_power()：实际上电时驱动高电平
  *     （+0x0 置 bit10）。
- * 本函数按"细节以 uboot 为准"原样合并这两步（天脉3 没有 DM_GPIO 框架，直接
- * 按 u-boot 里 !DM_GPIO 分支的裸寄存器写法照搬）。
+ * 本函数按"细节以 uboot 为准"原样合并这三步（天脉3 没有 DM_GPIO/DM_PINCTRL
+ * 框架，直接按 u-boot 里裸寄存器写法照搬）。
  *------------------------------------------------------------------------*/
+#define BM1684X_SD_PINMUX_BASE     0x50010400UL   /* TOP_BASE+0x400，u-boot PINMUX_BASE */
+#define BM1684X_SD_PINMUX_OFF      0x28U          /* PINMUX_SDIO 分支写的偏移 */
+#define BM1684X_SD_PINMUX_MASK     (0x3U << 4)    /* 该引脚功能选择字段，2 位 */
+#define BM1684X_SD_PINMUX_GPIO_SEL (0x1U << 4)    /* 选中 GPIO 功能 */
+
 #define BM1684X_SD_PWR_GPIO_BASE   0x50027400UL   /* port1a 控制器基址，u-boot BM_PORTB_BASE */
 #define BM1684X_SD_PWR_GPIO_BIT    (1U << 10)      /* SDIO_PWR_EN，对应 GPIO42 */
 
 static void bmSdPwrGpioInit(void)
 {
+    volatile u32 *pPinmux = (volatile u32 *)(BM1684X_SD_PINMUX_BASE + BM1684X_SD_PINMUX_OFF);
     volatile u32 *pSwMode = (volatile u32 *)(BM1684X_SD_PWR_GPIO_BASE + 0x8U);
     volatile u32 *pDir    = (volatile u32 *)(BM1684X_SD_PWR_GPIO_BASE + 0x4U);
     volatile u32 *pData   = (volatile u32 *)(BM1684X_SD_PWR_GPIO_BASE + 0x0U);
+
+    /* 第一步（这版新补）：顶层 pad mux，把这个引脚的功能选成 GPIO（对照
+     * board.c pinmux_config() 的 PINMUX_SDIO 分支）。不做这一步，下面对
+     * GPIO 控制器寄存器的读写在硬件上可能根本不生效。 */
+    *pPinmux = (*pPinmux & ~BM1684X_SD_PINMUX_MASK) | BM1684X_SD_PINMUX_GPIO_SEL;
+    BM_DSB();
 
     /* 选软件模式（对照 u-boot sdhci_init() 里 +0x8 那行：清 bit10） */
     *pSwMode &= ~BM1684X_SD_PWR_GPIO_BIT;
@@ -160,6 +187,64 @@ static void bmSdPwrGpioInit(void)
     *pData |= BM1684X_SD_PWR_GPIO_BIT;
     BM_DSB();
     delay_us(10000);   /* 给卡槛供电稳定留余量，求稳优先 */
+}
+
+/*--------------------------------------------------------------------------
+ * 【临时排障用】命令发送的调试包装：上一版反馈"错误码 -1，定位到
+ * bm1684xSdhciSendCmd 里返回的"，但该函数内部有两处都返回 -1（写命令寄存器
+ * 前等 CMD_INHIBIT/DAT_INHIBIT 清零超时；写完命令后等 CMD_COMPLETE 超时），
+ * 两种情况指向的硬件问题完全不同，且没说是哪条命令（CMD0/CMD8/ACMD41...）
+ * 失败。引擎层 bm1684xSdhci.c 是 eMMC/SD 共用的公共文件，不在这里改它；改成
+ * 在本文件每次调用前后读一把 PRESENT_STATE/INT_STATUS/ERR_INT_STATUS 原始
+ * 寄存器值打出来，失败时就能直接从串口日志看出"卡在哪条命令、卡在哪一步"，
+ * 不用再让用户自己去源码里对照行号。确认根因后会整段删除。*/
+static int sdSendCmdDbg(const char *name, BM1684X_MMC_CMD *pCmd, BM1684X_MMC_DATA *pData)
+{
+    int ret = bm1684xSdhciSendCmd(g_dev, pCmd, pData);
+
+    if (ret != 0)
+    {
+        volatile u32 *pState = (volatile u32 *)(BM1684X_SD_PHYS_BASE + SDHCI_PRESENT_STATE);
+        volatile u16 *pIntSt = (volatile u16 *)(BM1684X_SD_PHYS_BASE + SDHCI_INT_STATUS);
+        volatile u16 *pErrSt = (volatile u16 *)(BM1684X_SD_PHYS_BASE + SDHCI_ERR_INT_STATUS);
+        volatile u16 *pClkCt = (volatile u16 *)(BM1684X_SD_PHYS_BASE + SDHCI_CLOCK_CONTROL);
+        u32 state = *pState;
+        u16 intSt = *pIntSt;
+        u16 errSt = *pErrSt;
+        u16 clkCt = *pClkCt;
+
+        printf("[bm_sd] FAIL %s(CMD%u) ret=%d state=0x%08x int=0x%04x err=0x%04x"
+               " clk=0x%04x resp0=0x%08x data=%s inhibit=%s%s clk:%s%s%s\r\n",
+               name, (unsigned int)pCmd->cmdIdx, ret,
+               (unsigned int)state, (unsigned int)intSt, (unsigned int)errSt,
+               (unsigned int)clkCt, (unsigned int)pCmd->resp[0],
+               pData ? (pData->flags & BM1684X_DATA_READ ? "READ" : "WRITE") : "-",
+               (state & SDHCI_STATE_CMD_INHIBIT) ? "CMD," : "",
+               (state & SDHCI_STATE_DAT_INHIBIT) ? "DAT," : "",
+               (clkCt & SDHCI_CLK_INT_EN)     ? "INT_EN," : "INT_EN(0)!,",
+               (clkCt & SDHCI_CLK_INT_STABLE) ? "STABLE," : "STABLE(0)!,",
+               (clkCt & SDHCI_CLK_CARD_EN)    ? "CARD_EN" : "CARD_EN(0)!");
+        /* 判断依据：
+         *   - clk 那几位只要有任何一个打出 "(0)!"：说明发命令时 SDCLK 根本没有
+         *     真正起来（内部时钟没使能/没稳定/没送到卡），这是比"卡没插好"更
+         *     底层的问题——命令字节理论上都没法在总线上完整地发出去，需要回头
+         *     查 bmSdTopDomainInit() 和 bm1684xSdhciSetClk() 的时钟源选择/分频。
+         *   - clk 三位全部正常但仍然超时，分两种：
+         *     - inhibit 仍带 CMD/DAT：命令寄存器都没机会写下去，卡在
+         *       bm1684xSdhciSendCmd() 最前面那段"等 INHIBIT 清零"的超时；
+         *     - inhibit 不带：命令已经写下去，但控制器既没报错也没报完成——
+         *       多半是没有任何卡在线（总线悬空），控制器干等不到任何回应。
+         *   - err 非 0：硬件已经识别出错误（如 bit0=Command Timeout
+         *     Error，即卡确实没回应这条具体命令），这是最接近"卡有问题
+         *     /协议参数不对"的信号，需要重点看是哪条 CMD/ACMD。
+         *   - 带数据阶段（data=READ/WRITE）的命令专用判据：resp0 非 0（命令
+         *     本身已经拿到 R1 响应）+ err=0 + inhibit 不带 DAT，说明 CMD 阶段
+         *     成功，卡在了【数据阶段】（SDMA 一直没等到 XFER_COMPLETE）——
+         *     和"命令本身没人理"是完全不同的两类问题，前者要查 DMA/缓冲区，
+         *     后者要查总线/卡是否在线。resp0 仍是 0 则说明连命令的响应都没
+         *     拿到，跟数据阶段无关。*/
+    }
+    return ret;
 }
 
 /*--------------------------------------------------------------------------
@@ -179,7 +264,7 @@ static int sdWaitReady(void)
         cmd.cmdIdx   = SD_SEND_STATUS;
         cmd.cmdArg   = g_rca << 16;
         cmd.respType = BM1684X_RESP_R1;
-        ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+        ret = sdSendCmdDbg("CMD13", &cmd, NULL);
         if (ret != 0)
             return BM_SD_EIO;
 
@@ -205,13 +290,13 @@ static int sdSendAppCmd(u32 acmdIdx, u32 acmdArg, u32 respType, BM1684X_MMC_CMD 
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_APP_CMD; cmd.cmdArg = g_rca << 16; cmd.respType = BM1684X_RESP_R1;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = sdSendCmdDbg("CMD55", &cmd, NULL);
     if (ret != 0)
         return BM_SD_EIO;
 
     memset(pAcmdOut, 0, sizeof(*pAcmdOut));
     pAcmdOut->cmdIdx = acmdIdx; pAcmdOut->cmdArg = acmdArg; pAcmdOut->respType = respType;
-    ret = bm1684xSdhciSendCmd(g_dev, pAcmdOut, NULL);
+    ret = sdSendCmdDbg("ACMD", pAcmdOut, NULL);
     if (ret != 0)
         return BM_SD_EIO;
 
@@ -300,7 +385,7 @@ int bm_sd_init(void)
     /* CMD0：复位到 idle，对应 u-boot mmc_go_idle() */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_GO_IDLE_STATE; cmd.cmdArg = 0; cmd.respType = BM1684X_RESP_NONE;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = sdSendCmdDbg("CMD0", &cmd, NULL);
     if (ret != 0)
         return BM_SD_EIO;
     delay_us(2000);
@@ -310,7 +395,7 @@ int bm_sd_init(void)
      * SD 1.x 卡处理（不带 HCS，走字节寻址），不是阻塞性错误，继续往下走。*/
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_SEND_IF_COND; cmd.cmdArg = SD_IF_COND_ARG; cmd.respType = BM1684X_RESP_R7;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = sdSendCmdDbg("CMD8", &cmd, NULL);
     sdVersion2 = (ret == 0) && ((cmd.resp[0] & 0xFFU) == SD_IF_COND_CHECK_PATTERN);
 
     /* CMD55+ACMD41：轮询 OCR busy 位，对应 u-boot sd_send_op_cond()。
@@ -335,7 +420,7 @@ int bm_sd_init(void)
      * MMC_CMD_ALL_SEND_CID 那一段 */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_ALL_SEND_CID; cmd.cmdArg = 0; cmd.respType = BM1684X_RESP_R2;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = sdSendCmdDbg("CMD2", &cmd, NULL);
     if (ret != 0)
         return BM_SD_EIO;
 
@@ -343,7 +428,7 @@ int bm_sd_init(void)
      * SD_CMD_SEND_RELATIVE_ADDR 分支：response[0]>>16 取 RCA */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_SEND_RELATIVE_ADDR; cmd.cmdArg = 0; cmd.respType = BM1684X_RESP_R6;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = sdSendCmdDbg("CMD3", &cmd, NULL);
     if (ret != 0)
         return BM_SD_EIO;
     g_rca = (cmd.resp[0] >> 16) & 0xFFFFU;
@@ -358,7 +443,7 @@ int bm_sd_init(void)
      * 先求稳不读 CSD 里的 READ_BL_LEN 字段做特殊适配）。*/
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_SEND_CSD; cmd.cmdArg = g_rca << 16; cmd.respType = BM1684X_RESP_R2;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = sdSendCmdDbg("CMD9", &cmd, NULL);
     if (ret != 0)
         return BM_SD_EIO;
     csd[0] = cmd.resp[0]; csd[1] = cmd.resp[1]; csd[2] = cmd.resp[2]; csd[3] = cmd.resp[3];
@@ -384,7 +469,7 @@ int bm_sd_init(void)
     /* CMD7：选中卡，进入传输态 */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_SELECT_CARD; cmd.cmdArg = g_rca << 16; cmd.respType = BM1684X_RESP_R1B;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = sdSendCmdDbg("CMD7", &cmd, NULL);
     if (ret != 0)
         return BM_SD_EIO;
 
@@ -409,7 +494,7 @@ int bm_sd_init(void)
     /* CMD16：设块长 512（块寻址下无副作用，字节寻址的老卡则是必需步骤） */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = SD_SET_BLOCKLEN; cmd.cmdArg = BM_SD_BLOCK_SIZE; cmd.respType = BM1684X_RESP_R1;
-    (void)bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    (void)sdSendCmdDbg("CMD16", &cmd, NULL);
 
     g_inited = 1;
     return BM_SD_OK;
@@ -450,7 +535,9 @@ int bm_sd_read_blocks(u32 lba, u32 count, void *buf)
     cmd.cmdArg   = lbaToArg(lba);
     cmd.respType = BM1684X_RESP_R1;
 
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, &data);
+    /* 改走 sdSendCmdDbg 包装：之前这里直接调引擎层，读失败时啥也不打印，
+     * 排不出是命令阶段还是数据阶段卡住的；现在和命令类排障走同一套日志。*/
+    ret = sdSendCmdDbg("READ", &cmd, &data);
     if (ret != 0)
         return BM_SD_EIO;
 
@@ -494,7 +581,7 @@ int bm_sd_write_blocks(u32 lba, u32 count, const void *buf)
     cmd.cmdArg   = lbaToArg(lba);
     cmd.respType = BM1684X_RESP_R1;
 
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, &data);
+    ret = sdSendCmdDbg("WRITE", &cmd, &data);
     if (ret != 0)
         return BM_SD_EIO;
 
