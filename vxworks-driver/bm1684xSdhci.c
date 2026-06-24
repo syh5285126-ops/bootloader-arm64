@@ -723,13 +723,26 @@ int bm1684xSdhciSendCmd(BM1684X_SDHCI_DEV *pDev,
             return rc;
         }
         if (sts & SDHCI_INT_DMA_END) {
-            /* SDMA 512 KB boundary: reload address to continue。
-             * V4模式下真正地址在 ADMA_SA_LOW，原因同上（bm1684xSdhciSendCmd()
-             * 里的根因说明）。 */
+            /* SDMA 512 KB 边界：到达边界后控制器暂停并发 DMA_END，必须由软件
+             * "重写一次 SDMA 系统地址寄存器"才会越过边界继续传——这个【写动作】
+             * 本身就是续传触发信号，不是单纯刷新地址值。
+             *
+             * 【本次根因修正】V4 64 位寻址模式下，SDMA 系统地址是 64 位：低 32 位
+             * 在 ADMA_SA_LOW(0x58)、高 32 位在 ADMA_SA_HIGH(0x5C)，地址的"提交/
+             * 续传触发"落在写高位那一下。之前这里只读回写了低位、从没碰高位，
+             * 于是 64 位模式下越过边界的续传始终没被触发，DMA 停在边界处不动，
+             * 数据阶段一直等不到 XFER_COMPLETE 而超时——正好解释"单块写
+             * (不跨边界，不走这条重载)能过、≥512KB 大块写(跨边界)必卡死"。
+             * 两份参考实现 TF-A bm_sd.c 与 VxWorks 版 vxbBm1684xSdhci.c 在重载时
+             * 都写了高位；但它们缓冲区在 4GB 以内、高位写的是 0，本项目缓冲区在
+             * 4GB 以上(is64Bit)，高位【不能写 0】，必须把控制器已自增好的真实
+             * 低/高位都读回来按原值写回，并把高位放在最后写作为续传触发。 */
             unsigned short hc2reg = REG_RD16(pDev->base, SDHCI_HOST_CONTROL2);
             if (hc2reg & SDHCI_HC2_VER4_ENABLE) {
-                unsigned int sa = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
-                REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW, sa);
+                unsigned int saLo = REG_RD32(pDev->base, SDHCI_ADMA_SA_LOW);
+                unsigned int saHi = REG_RD32(pDev->base, SDHCI_ADMA_SA_HIGH);
+                REG_WR32(pDev->base, SDHCI_ADMA_SA_LOW,  saLo);
+                REG_WR32(pDev->base, SDHCI_ADMA_SA_HIGH, saHi); /* 最后写高位=续传触发 */
             } else {
                 unsigned int sa = REG_RD32(pDev->base, SDHCI_DMA_ADDRESS);
                 REG_WR32(pDev->base, SDHCI_DMA_ADDRESS, sa);

@@ -22,6 +22,7 @@
 #ifdef BM1684X_EMMC
 
 #include <string.h>
+#include <stdio.h>
 #include "bm_emmc.h"
 #include "bm1684xSdhciOsal.h"
 #include "bm1684xSdhciHw.h"
@@ -72,6 +73,7 @@ extern void delay_us(unsigned int time_us);
 #define MMC_SELECT_CARD           7
 #define MMC_SEND_EXT_CSD          8
 #define MMC_SEND_CSD              9
+#define MMC_STOP_TRANSMISSION     12          /* 多块传输结束后停止 */
 #define MMC_SEND_STATUS           13
 #define MMC_SET_BLOCKLEN          16
 #define MMC_READ_SINGLE_BLOCK     17
@@ -146,6 +148,81 @@ static void bmTopDomainInit(void)
 }
 
 /*--------------------------------------------------------------------------
+ * 【诊断打印】命令发送的调试包装，从 bm_sd_core.c 的 sdSendCmdDbg() 搬过来——
+ * eMMC 之前格式化阶段报错时原代码只 return BM_EMMC_EIO，没有任何寄存器现场
+ * 信息，分不清是"命令没人理"还是"数据阶段 DMA 没收到完成信号"，也不知道是
+ * 格式化时哪一条命令、写到哪个 LBA、多大的块数失败。逻辑和 SD 版完全一致
+ * （同一套 SDHCI 寄存器定义、同一个引擎层），仅把基址换成 eMMC 控制器的
+ * BM1684X_EMMC_PHYS_BASE。确认根因后可以整段删除。
+ *------------------------------------------------------------------------*/
+#define SDHCI_ERR_CMD_TIMEOUT   (1U << 0)   /* 命令超时：卡没回应这条命令 */
+#define SDHCI_ERR_CMD_CRC       (1U << 1)
+#define SDHCI_ERR_CMD_END_BIT   (1U << 2)
+#define SDHCI_ERR_CMD_INDEX     (1U << 3)
+#define SDHCI_ERR_DATA_TIMEOUT  (1U << 4)   /* 数据阶段超时：发完命令但数据没传完 */
+#define SDHCI_ERR_DATA_CRC      (1U << 5)
+#define SDHCI_ERR_DATA_END_BIT  (1U << 6)
+#define SDHCI_ERR_CURRENT_LIMIT (1U << 7)
+#define SDHCI_ERR_AUTO_CMD      (1U << 8)
+#define SDHCI_ERR_ADMA          (1U << 9)   /* ADMA 描述符/地址错误 */
+
+static const char *mmcDecodeErrSts(u16 errSt)
+{
+    if (errSt & SDHCI_ERR_ADMA)         return "ADMA_ERROR";
+    if (errSt & SDHCI_ERR_AUTO_CMD)     return "AUTO_CMD_ERROR";
+    if (errSt & SDHCI_ERR_DATA_CRC)     return "DATA_CRC_ERROR";
+    if (errSt & SDHCI_ERR_DATA_END_BIT) return "DATA_END_BIT_ERROR";
+    if (errSt & SDHCI_ERR_DATA_TIMEOUT) return "DATA_TIMEOUT_ERROR";
+    if (errSt & SDHCI_ERR_CMD_INDEX)    return "CMD_INDEX_ERROR";
+    if (errSt & SDHCI_ERR_CMD_END_BIT)  return "CMD_END_BIT_ERROR";
+    if (errSt & SDHCI_ERR_CMD_CRC)      return "CMD_CRC_ERROR";
+    if (errSt & SDHCI_ERR_CMD_TIMEOUT)  return "CMD_TIMEOUT_ERROR";
+    return errSt ? "UNKNOWN" : "(none-latched)";
+}
+
+static int mmcSendCmdDbg(const char *name, BM1684X_MMC_CMD *pCmd, BM1684X_MMC_DATA *pData)
+{
+    int ret = bm1684xSdhciSendCmd(g_dev, pCmd, pData);
+
+    if (ret != 0)
+    {
+        volatile u32 *pState = (volatile u32 *)(BM1684X_EMMC_PHYS_BASE + SDHCI_PRESENT_STATE);
+        volatile u16 *pIntSt = (volatile u16 *)(BM1684X_EMMC_PHYS_BASE + SDHCI_INT_STATUS);
+        volatile u16 *pErrSt = (volatile u16 *)(BM1684X_EMMC_PHYS_BASE + SDHCI_ERR_INT_STATUS);
+        volatile u16 *pClkCt = (volatile u16 *)(BM1684X_EMMC_PHYS_BASE + SDHCI_CLOCK_CONTROL);
+        u32 state = *pState;
+        u16 intSt = *pIntSt;
+        u16 errSt = *pErrSt;
+        u16 clkCt = *pClkCt;
+        /* 实时寄存器值在 ret=BM_ERR_HW 时已被引擎层清空/复位，真实出错现场要看
+         * 下面这两个"快照"（引擎层在清空前保存下来的） */
+        u32 latchedInt = bm1684xSdhciGetLastIntStatus(g_dev);
+        u16 latchedErr = (u16)bm1684xSdhciGetLastErrStatus(g_dev);
+
+        printf("[bm_emmc] FAIL %s(CMD%u) ret=%d state=0x%08x int=0x%04x err=0x%04x"
+               " clk=0x%04x resp0=0x%08x arg=0x%08x blkCnt=%u buf=%p align512k=0x%05x"
+               " data=%s inhibit=%s%s clk:%s%s%s"
+               " latched_int=0x%08x latched_err=0x%04x(%s)\r\n",
+               name, (unsigned int)pCmd->cmdIdx, ret,
+               (unsigned int)state, (unsigned int)intSt, (unsigned int)errSt,
+               (unsigned int)clkCt, (unsigned int)pCmd->resp[0],
+               (unsigned int)pCmd->cmdArg,
+               pData ? pData->blkCount : 0U,
+               pData ? pData->buf : NULL,
+               pData ? (unsigned int)(((unsigned long)pData->buf) & 0x7FFFFUL) : 0U,
+               pData ? (pData->flags & BM1684X_DATA_READ ? "READ" : "WRITE") : "-",
+               (state & SDHCI_STATE_CMD_INHIBIT) ? "CMD," : "",
+               (state & SDHCI_STATE_DAT_INHIBIT) ? "DAT," : "",
+               (clkCt & SDHCI_CLK_INT_EN)     ? "INT_EN," : "INT_EN(0)!,",
+               (clkCt & SDHCI_CLK_INT_STABLE) ? "STABLE," : "STABLE(0)!,",
+               (clkCt & SDHCI_CLK_CARD_EN)    ? "CARD_EN" : "CARD_EN(0)!",
+               (unsigned int)latchedInt, (unsigned int)latchedErr,
+               mmcDecodeErrSts(latchedErr));
+    }
+    return ret;
+}
+
+/*--------------------------------------------------------------------------
  * 等待卡回到可用状态（CMD13 轮询）
  *------------------------------------------------------------------------*/
 static int mmcWaitReady(void)
@@ -161,7 +238,7 @@ static int mmcWaitReady(void)
         cmd.cmdIdx   = MMC_SEND_STATUS;
         cmd.cmdArg   = g_rca << 16;
         cmd.respType = BM1684X_RESP_R1;
-        ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+        ret = mmcSendCmdDbg("STATUS", &cmd, NULL);
         if (ret != 0)
             return BM_EMMC_EIO;
 
@@ -176,6 +253,26 @@ static int mmcWaitReady(void)
 }
 
 /*--------------------------------------------------------------------------
+ * 多块传输（CMD18/CMD25）结束后发 CMD12 停止传输。
+ * 与 bm_sd_core.c 的 sdStopTransmission() 同一原因：共用引擎层
+ * bm1684xSdhci.c 的 buildXferMode() 已【从不用 AUTO_CMD12】（本颗 Synopsys/
+ * 比特大陆控制器在 V4 模式下用 AUTO_CMD12 会在命令阶段报错），改由上层在多块
+ * 传完后显式发一条 CMD12 收尾。eMMC 之前漏了这一步——单块读写没事，但格式化
+ * 时的大块多扇区连续写(CMD25)传完后控制器 DAT 线一直占着，紧跟的命令发不出去
+ * 而失败，正是缺这条 CMD12。CMD12 是带忙信号的 R1b 响应。
+ *------------------------------------------------------------------------*/
+static int mmcStopTransmission(void)
+{
+    BM1684X_MMC_CMD cmd;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cmdIdx   = MMC_STOP_TRANSMISSION;
+    cmd.cmdArg   = 0;
+    cmd.respType = BM1684X_RESP_R1B;
+    return mmcSendCmdDbg("CMD12", &cmd, NULL);
+}
+
+/*--------------------------------------------------------------------------
  * 修改 EXT_CSD 单字节（CMD6 SWITCH），并等待生效
  *------------------------------------------------------------------------*/
 static int mmcSwitch(u8 index, u8 value)
@@ -187,7 +284,7 @@ static int mmcSwitch(u8 index, u8 value)
     cmd.cmdIdx   = MMC_SWITCH;
     cmd.cmdArg   = MMC_SWITCH_ARG(index, value);
     cmd.respType = BM1684X_RESP_R1B;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = mmcSendCmdDbg("SWITCH", &cmd, NULL);
     if (ret != 0)
         return BM_EMMC_EIO;
 
@@ -241,7 +338,7 @@ int bm_emmc_init(void)
     /* CMD0：复位到 idle */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = MMC_GO_IDLE_STATE; cmd.cmdArg = 0; cmd.respType = BM1684X_RESP_NONE;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = mmcSendCmdDbg("IDLE", &cmd, NULL);
     if (ret != 0)
         return BM_EMMC_EIO;
     delay_us(2000);
@@ -252,7 +349,7 @@ int bm_emmc_init(void)
     {
         memset(&cmd, 0, sizeof(cmd));
         cmd.cmdIdx = MMC_SEND_OP_COND; cmd.cmdArg = MMC_OCR_ARG; cmd.respType = BM1684X_RESP_R3;
-        ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+        ret = mmcSendCmdDbg("OP_COND", &cmd, NULL);
         if (ret != 0)
             return BM_EMMC_EIO;
         if (cmd.resp[0] & MMC_OCR_BUSY)
@@ -266,28 +363,28 @@ int bm_emmc_init(void)
     /* CMD2：读 CID（进入识别态） */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = MMC_ALL_SEND_CID; cmd.cmdArg = 0; cmd.respType = BM1684X_RESP_R2;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = mmcSendCmdDbg("ALL_CID", &cmd, NULL);
     if (ret != 0)
         return BM_EMMC_EIO;
 
     /* CMD3：主机给卡分配 RCA */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = MMC_SET_RELATIVE_ADDR; cmd.cmdArg = g_rca << 16; cmd.respType = BM1684X_RESP_R1;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = mmcSendCmdDbg("REL_ADDR", &cmd, NULL);
     if (ret != 0)
         return BM_EMMC_EIO;
 
     /* CMD9：读 CSD（容量以 EXT_CSD SEC_COUNT 为准，此处仅完成状态机流转） */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = MMC_SEND_CSD; cmd.cmdArg = g_rca << 16; cmd.respType = BM1684X_RESP_R2;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = mmcSendCmdDbg("SEND_CSD", &cmd, NULL);
     if (ret != 0)
         return BM_EMMC_EIO;
 
     /* CMD7：选中卡，进入传输态 */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = MMC_SELECT_CARD; cmd.cmdArg = g_rca << 16; cmd.respType = BM1684X_RESP_R1B;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    ret = mmcSendCmdDbg("SELECT", &cmd, NULL);
     if (ret != 0)
         return BM_EMMC_EIO;
 
@@ -311,7 +408,7 @@ int bm_emmc_init(void)
     data.buf = g_extCsd; data.blkSize = BM_EMMC_BLOCK_SIZE; data.blkCount = 1U;
     data.flags = BM1684X_DATA_READ;
     cmd.cmdIdx = MMC_SEND_EXT_CSD; cmd.cmdArg = 0; cmd.respType = BM1684X_RESP_R1;
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, &data);
+    ret = mmcSendCmdDbg("EXT_CSD", &cmd, &data);
     if (ret == 0)
     {
         /* DMA 写入完成，CPU 读取前先让缓存失效，避免读到旧值（同读扇区路径，
@@ -328,7 +425,7 @@ int bm_emmc_init(void)
     /* CMD16：设块长 512（扇区寻址下无副作用，保持兼容） */
     memset(&cmd, 0, sizeof(cmd));
     cmd.cmdIdx = MMC_SET_BLOCKLEN; cmd.cmdArg = BM_EMMC_BLOCK_SIZE; cmd.respType = BM1684X_RESP_R1;
-    (void)bm1684xSdhciSendCmd(g_dev, &cmd, NULL);
+    (void)mmcSendCmdDbg("SET_BLOCKLEN", &cmd, NULL);
 
     g_inited = 1;
     return BM_EMMC_OK;
@@ -359,6 +456,15 @@ int bm_emmc_read_blocks(u32 lba, u32 count, void *buf)
     if ((count == 0U) || (buf == NULL))
         return BM_EMMC_EPARAM;
 
+    /* 读卡前也要先 invalidate 接收缓冲区（与 bm_sd_read_blocks 保持一致）：
+     * 参考驱动 bm_sd_prepare() 对读写都无条件先做一次缓存维护，不是只在读完
+     * 之后做。如果 buf 之前残留了缓存里的旧内容（哪怕是干净行），DMA 写入期间
+     * 该缓存行仍可能有效，导致读完后 CPU 命中旧值——SD 那条线实测复现过"读命令
+     * 成功、字节0却是旧值"，就是漏了读前这一次。补 dsb 保证"丢弃旧缓存行"排在
+     * 后面引擎层启动 DMA 的寄存器写之前。*/
+    ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, buf, count * BM_EMMC_BLOCK_SIZE);
+    BM_DSB();
+
     memset(&data, 0, sizeof(data));
     data.buf = buf; data.blkSize = BM_EMMC_BLOCK_SIZE; data.blkCount = count;
     data.flags = BM1684X_DATA_READ;
@@ -368,9 +474,19 @@ int bm_emmc_read_blocks(u32 lba, u32 count, void *buf)
     cmd.cmdArg   = lbaToArg(lba);
     cmd.respType = BM1684X_RESP_R1;
 
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, &data);
+    ret = mmcSendCmdDbg("READ", &cmd, &data);
     if (ret != 0)
         return BM_EMMC_EIO;
+
+    /* 多块读(CMD18)是开放式命令，传完要显式发 CMD12 停止（引擎层不再用
+     * AUTO_CMD12，与 bm_sd_read_blocks 一致）。单块读(CMD17)自带终止，
+     * 不需要 CMD12。*/
+    if (count > 1U)
+    {
+        ret = mmcStopTransmission();
+        if (ret != 0)
+            return BM_EMMC_EIO;
+    }
 
     /* 先补一道 dsb，确保"引擎层已观察到 DMA 传输完成"（最后那次 Device 状态寄存器
      * 读）排在下面 invalidate 之前——避免在 DMA 尚未真正写完内存时就丢弃缓存行。
@@ -414,9 +530,20 @@ int bm_emmc_write_blocks(u32 lba, u32 count, const void *buf)
     cmd.cmdArg   = lbaToArg(lba);
     cmd.respType = BM1684X_RESP_R1;
 
-    ret = bm1684xSdhciSendCmd(g_dev, &cmd, &data);
+    ret = mmcSendCmdDbg("WRITE", &cmd, &data);
     if (ret != 0)
         return BM_EMMC_EIO;
+
+    /* 多块写(CMD25)是开放式命令，传完要显式发 CMD12 停止（引擎层不再用
+     * AUTO_CMD12，与 bm_sd_write_blocks 一致）。单块写(CMD24)自带终止，
+     * 不需要 CMD12。eMMC 之前漏了这条，格式化大块连续写传完后 DAT 线没释放、
+     * 紧跟命令发不出去——大概率就是格式化阶段报错的根因。*/
+    if (count > 1U)
+    {
+        ret = mmcStopTransmission();
+        if (ret != 0)
+            return BM_EMMC_EIO;
+    }
 
     /* 等卡内部编程完成，确保数据落盘 */
     return mmcWaitReady();

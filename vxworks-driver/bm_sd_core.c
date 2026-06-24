@@ -257,14 +257,23 @@ static int sdSendCmdDbg(const char *name, BM1684X_MMC_CMD *pCmd, BM1684X_MMC_DAT
          * resp0=0 说明卡在命令阶段），之后全变 ret=-3"，要确认第一条失败的
          * 是不是格式化时的大块连续写（比如一整簇 128 扇区），LBA(cmdArg)和
          * 块数缺一不可，之前没打印这两个，看不出来。 */
+        /* 新增 buf=/align512k=：定位"blkcnt=1024(整 512KB) 写失败"这个新现象——
+         * 怀疑是 DMA 缓冲区地址正好落在 SDMA 512KB 边界对齐点上、且本次传输
+         * 长度正好是一个边界单位，触发控制器"地址到边界 + 块数同时归零"这个
+         * 极端情况下漏发完成中断的硬件corner case（推测，未上板证实）。
+         * 把 pData->buf 的地址和它对 512KB 取模的余数打出来，下次失败时
+         * 一眼能看出余数是不是 0（=完全对齐，印证猜测）。 */
         printf("[bm_sd] FAIL %s(CMD%u) ret=%d state=0x%08x int=0x%04x err=0x%04x"
-               " clk=0x%04x resp0=0x%08x arg=0x%08x blkCnt=%u data=%s inhibit=%s%s clk:%s%s%s"
+               " clk=0x%04x resp0=0x%08x arg=0x%08x blkCnt=%u buf=%p align512k=0x%05x"
+               " data=%s inhibit=%s%s clk:%s%s%s"
                " latched_int=0x%08x latched_err=0x%04x(%s)\r\n",
                name, (unsigned int)pCmd->cmdIdx, ret,
                (unsigned int)state, (unsigned int)intSt, (unsigned int)errSt,
                (unsigned int)clkCt, (unsigned int)pCmd->resp[0],
                (unsigned int)pCmd->cmdArg,
                pData ? pData->blkCount : 0U,
+               pData ? pData->buf : NULL,
+               pData ? (unsigned int)(((unsigned long)pData->buf) & 0x7FFFFUL) : 0U,
                pData ? (pData->flags & BM1684X_DATA_READ ? "READ" : "WRITE") : "-",
                (state & SDHCI_STATE_CMD_INHIBIT) ? "CMD," : "",
                (state & SDHCI_STATE_DAT_INHIBIT) ? "DAT," : "",
