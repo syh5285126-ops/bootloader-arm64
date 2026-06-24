@@ -35,8 +35,12 @@
 #define BM_SD_BUS_WIDTH         4
 #endif
 
-/* SDMA 地址位宽：0=32位地址  1=64位地址。BM1684X DRAM 物理地址范围未确认
- * 超过 4GB 的场景，先按 32 位求稳，需要时再打开 */
+/* SDMA 地址位宽：0=32位地址  1=64位地址。
+ * 【已不再起决定作用，仅作初值】引擎层 hwInit() 现在照参考驱动按硬件能力
+ * （CAPABILITIES1 bit27）自动判定并开启 64 位寻址，不依赖这个开关。
+ * 上板实测确认本板 DRAM 在 4GB 以上（DMA 缓冲区物理地址高 32 位非 0），
+ * 必须用 64 位寻址，否则 DMA 地址被截断、写卡数据阶段超时——这就是之前
+ * 写失败的真正根因，详见 README 第十二节。 */
 #ifndef BM_SD_USE_64BIT_DMA
 #define BM_SD_USE_64BIT_DMA     0
 #endif

@@ -93,6 +93,21 @@ static int pollWaitStatus(struct BM1684X_SDHCI_DEV *pDev,
               ((unsigned int)REG_RD16(pDev->base, SDHCI_ERR_INT_STATUS) << 16);
 
         if (sts & SDHCI_INT_ERROR) {
+            /* 【排障发现的诊断盲区，已修复】轮询模式下这里清完 INT_STATUS/
+             * ERR_INT_STATUS 后直接返回 BM_ERR_HW，调用方 bm_sd_core.c 的
+             * sdSendCmdDbg() 是在 bm1684xSdhciSendCmd() 返回之后才去读硬件
+             * 寄存器打印诊断信息的——但那时寄存器已经被清空，且
+             * bm1684xSdhciSendCmd() 在返回前还调用了 sdhciReset()，
+             * PRESENT_STATE 也已经复位回空闲态。于是日志一直打印出
+             * "int=0x0000 err=0x0000、state 是干净空闲态"，看起来跟 BM_ERR_HW
+             * 矛盾，实际是清错在前、打印在后，把现场清掉了。这里仿照 ISR
+             * 路径（isrStatus/isrErrSts 是 IRQ 模式才会填，轮询模式从未填过）
+             * 把出错那一刻的原始值保存下来，调用方可以用新增的
+             * bm1684xSdhciGetLastIntStatus()/GetLastErrStatus() 取到真实现场，
+             * 不用再猜。 */
+            pDev->isrStatus = sts;
+            pDev->isrErrSts = (sts >> 16) & 0xFFFFU;
+
             REG_WR16(pDev->base, SDHCI_ERR_INT_STATUS,
                      REG_RD16(pDev->base, SDHCI_ERR_INT_STATUS));
             REG_WR16(pDev->base, SDHCI_INT_STATUS, SDHCI_INT_ERROR);
@@ -265,6 +280,20 @@ static int hwInit(struct BM1684X_SDHCI_DEV *pDev)
     rc = sdhciReset(pDev, SDHCI_RESET_ALL);
     if (rc != BM_OK) return rc;
 
+    /* 64位 DMA 寻址：照参考驱动 bm_sd_hw_init()——读控制器能力寄存器
+     * CAPABILITIES1(0x40) 的 bit27（V4 模式 64 位系统地址支持），硬件支持就
+     * 打开 HOST_CONTROL2 的 64BIT_ADDR(bit13)，并把 is64Bit 标志置上让发命令
+     * 时一并写 ADMA_SA_HIGH。
+     * 【这是上板写失败的真正根因】本板 DRAM 在 4GB 以上（日志里 Ramdisk、
+     * selftest 缓冲区地址都是 0x3_xxxx_xxxx），DMA 缓冲区物理地址高 32 位非 0。
+     * 原来写死 BM_SD_USE_64BIT_DMA=0、从不开 64 位寻址，控制器只认地址低 32
+     * 位 → DMA 打到被截断的错误地址（0x3_08af_5200 → 0x08af_5200）→ 数据
+     * 阶段永远等不到完成而超时；而 CMD24 命令本身只走命令线、不碰 DMA，所以
+     * 命令能过、卡回正常 R1，唯独数据搬运卡死——正是上板现象。改成按硬件能力
+     * 自动开启，不再依赖那个写死的配置开关（eMMC 路径同样受益）。 */
+    if (REG_RD32(pDev->base, SDHCI_CAPABILITIES) & SDHCI_CAP2_SYS_ADDR_64)
+        pDev->is64Bit = 1U;
+
     /* Set version-4 mode, optionally 64-bit addressing, CMD23 support */
     hc2 = (unsigned short)(SDHCI_HC2_VER4_ENABLE | SDHCI_HC2_CMD23_SUPPORT);
     if (pDev->is64Bit)
@@ -421,20 +450,22 @@ static unsigned short buildXferMode(const BM1684X_MMC_DATA *pData)
     /* 传输模式口径对照【本芯片专用、已跑通】的参考驱动 bm_sd.c
      * （bm_sd_send_cmd_with_data 第 88~99 行）：它对读(CMD17/18)和写(CMD24/25)
      * 【一律带上 TRNS_MULTI】，连单块也带，靠 BLK_CNT_EN + 块数寄存器=1 来界定
-     * 只传一块；并且【从不用 AUTO_CMD12】。
+     * 只传一块；并且【从不用 AUTO_CMD12】，多块传输由上层在传完后显式发 CMD12。
      * 注意：这一点与 u-boot 通用 sdhci.c 不一致（u-boot 只在块数>1 时才置
      * MULTI）。本项目其余细节遵循"以 u-boot 为准"，但这条是 BM1684X 这颗
      * Synopsys/比特大陆控制器的硬件特性：单块模式(MULTI=0)下写命令做完数据后，
      * 卡进入"编程忙"，控制器的 DAT 忙位疑似清不干净——表现为单块写之后 DAT
-     * 一直占用，紧跟的命令(CMD13/CMD17)发不出去而超时（读因为没有写后编程忙，
-     * 单块也能过，所以之前"读好了写不行"的不对称正好对得上）。参考驱动用
-     * "一律 MULTI"绕开了这个单块模式的坑。这里照搬参考驱动，单块也置 MULTI；
-     * AUTO_CMD12 仅在真正多块时才用（比参考驱动更省一条显式 CMD12，对单块无
-     * 影响）。 */
+     * 一直占用，紧跟的命令(CMD13/CMD17)发不出去而超时。参考驱动用"一律 MULTI"
+     * 绕开了这个单块模式的坑。这里照搬参考驱动，单块也置 MULTI。
+     *
+     * 【AUTO_CMD12 已去掉，这是多块写失败的根因】之前自作主张在多块时加了
+     * AUTO_CMD12（想省一条显式 CMD12），结果单块写(CMD24，无 AUTO_CMD12)能过、
+     * 多块写(CMD25，带 AUTO_CMD12)一上来就在命令阶段报错——上板日志实锤：
+     * selftest 单块自检通过、FAT 格式化的 CMD25 多块写全程失败。本颗控制器在
+     * V4 模式下 AUTO_CMD12 有问题，参考驱动从不用它。现严格照参考驱动：传输模式
+     * 永不置 AUTO_CMD12，多块传输由 bm_sd_core.c 在传完后显式发 CMD12 收尾。 */
     unsigned short mode = SDHCI_TRNS_DMA | SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_MULTI;
 
-    if (pData->blkCount > 1U)
-        mode |= SDHCI_TRNS_AUTO_CMD12;
     if (pData->flags & BM1684X_DATA_READ)
         mode |= SDHCI_TRNS_READ;
 
@@ -722,6 +753,24 @@ int bm1684xSdhciCardPresent(BM1684X_SDHCI_DEV *pDev)
     if (pDev->devIndex == BM1684X_EMMC_INDEX) return 1;
     return (REG_RD32(pDev->base, SDHCI_PRESENT_STATE) &
             SDHCI_STATE_CARD_PRESENT) ? 1 : 0;
+}
+
+/*--------------------------------------------------------------------------
+ * 取最近一次 bm1684xSdhciSendCmd() 失败时刻、清空前捕获到的原始
+ * INT_STATUS|（ERR_INT_STATUS<<16）/ERR_INT_STATUS 值。轮询模式下由
+ * pollWaitStatus() 在 SDHCI_INT_ERROR 出现的那一刻保存；中断模式下由
+ * bm1684xSdhciIsr() 保存。调用方（bm_sd_core.c 的诊断打印）应改用这两个
+ * 接口而不是事后再读硬件寄存器——事后寄存器已经被清空、控制器也可能已被
+ * sdhciReset() 复位回空闲态，读到的是假的"无错误"现场。
+ *------------------------------------------------------------------------*/
+unsigned int bm1684xSdhciGetLastIntStatus(BM1684X_SDHCI_DEV *pDev)
+{
+    return pDev ? pDev->isrStatus : 0U;
+}
+
+unsigned int bm1684xSdhciGetLastErrStatus(BM1684X_SDHCI_DEV *pDev)
+{
+    return pDev ? pDev->isrErrSts : 0U;
 }
 
 /* -------------------------------------------------------------------------

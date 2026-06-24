@@ -49,12 +49,14 @@
 #define BM_DSB()   __asm__ __volatile__ (""        ::: "memory")
 #endif
 
-/* 天脉3 平台提供的 DMA 缓冲区 cache 维护接口（已向用户确认函数名与参数）：
+/* 天脉3 平台提供的 DMA 缓冲区 cache 维护接口（已向用户核实真实签名为
+ * ACoreOs_status_code ACoreOs_cache_flush/invalidate(ACoreOs_cache_types type,
+ * void *pStartAddr, ULONG size)，声明在天脉3 SDK 的 cache.h 里，故此处改为
+ * 包含该头文件，不再自行 extern 声明）：
  *   写卡前对发送缓冲区 flush —— 把 CPU 缓存里的最新数据刷到内存，DMA 才能读到正确内容；
  *   读卡完成后对接收缓冲区 invalidate —— 强制 CPU 重新从内存读取 DMA 刚写入的数据。
- * 不在本仓库中，按约定签名声明为 extern。*/
-extern void ACoreOs_cache_flush(void *addr, unsigned int len);
-extern void ACoreOs_cache_invalidate(void *addr, unsigned int len);
+ * type 统一传 ACOREOS_CACHE_DAT（数据缓存，本驱动不涉及指令缓存）。*/
+#include "cache.h"
 
 /* 天脉3 平台提供的微秒级延时函数（同 bm_emmc_osal_os3.c 假设） */
 extern void delay_us(unsigned int time_us);
@@ -315,7 +317,7 @@ int bm_emmc_init(void)
         /* DMA 写入完成，CPU 读取前先让缓存失效，避免读到旧值（同读扇区路径，
          * 先 dsb 定序 DMA 完成观测，再 invalidate） */
         BM_DSB();
-        ACoreOs_cache_invalidate(g_extCsd, BM_EMMC_BLOCK_SIZE);
+        ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, g_extCsd, BM_EMMC_BLOCK_SIZE);
 
         g_blockCount = (u32)g_extCsd[EXT_CSD_SEC_COUNT]
                       | ((u32)g_extCsd[EXT_CSD_SEC_COUNT + 1] << 8)
@@ -374,7 +376,7 @@ int bm_emmc_read_blocks(u32 lba, u32 count, void *buf)
      * 读）排在下面 invalidate 之前——避免在 DMA 尚未真正写完内存时就丢弃缓存行。
      * 然后 invalidate 接收缓冲区，强制 CPU 重新从内存读取 DMA 刚写入的数据。*/
     BM_DSB();
-    ACoreOs_cache_invalidate(buf, count * BM_EMMC_BLOCK_SIZE);
+    ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, buf, count * BM_EMMC_BLOCK_SIZE);
     return BM_EMMC_OK;
 }
 
@@ -400,7 +402,7 @@ int bm_emmc_write_blocks(u32 lba, u32 count, const void *buf)
      * flush 之后补一道 dsb：保证"数据落内存"这件事，排在后面引擎层启动 DMA 的寄存器
      * 写之前完成（普通内存→Device 内存的跨域定序，volatile 管不了）。正确实现的
      * cache_flush 内部本就带尾部 dsb，这里再补一道是冗余但零风险的保险。*/
-    ACoreOs_cache_flush((void *)buf, count * BM_EMMC_BLOCK_SIZE);
+    ACoreOs_cache_flush(ACOREOS_CACHE_DAT, (void *)buf, count * BM_EMMC_BLOCK_SIZE);
     BM_DSB();
 
     memset(&data, 0, sizeof(data));

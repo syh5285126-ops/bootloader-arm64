@@ -132,12 +132,31 @@ int bm_sd_selftest(u32 test_lba)
         return ret;
     }
 
-    for (i = 0; i < BM_SD_BLOCK_SIZE; i++)
+    /* 排障需要：不要一发现第一个错字节就退出，统计全块的错误字节数，
+     * 区分"整块都没收到新数据"（错误数=512，多半是缓存/DMA没生效）跟
+     * "只有局部错位"（错误数很少，多半是地址算错了几个字节）这两类问题。
+     * 最多打印前 4 个错误位置，避免日志刷屏。 */
     {
-        if (rbuf[i] != wbuf[i])
+        u32 mismatchCount = 0;
+        u32 printed = 0;
+
+        for (i = 0; i < BM_SD_BLOCK_SIZE; i++)
         {
-            printf("[bm_sd] selftest: MISMATCH at byte %u (w=0x%02X r=0x%02X)\r\n",
-                   i, wbuf[i], rbuf[i]);
+            if (rbuf[i] != wbuf[i])
+            {
+                mismatchCount++;
+                if (printed < 4U)
+                {
+                    printf("[bm_sd] selftest: MISMATCH at byte %u (w=0x%02X r=0x%02X)\r\n",
+                           i, wbuf[i], rbuf[i]);
+                    printed++;
+                }
+            }
+        }
+        if (mismatchCount != 0U)
+        {
+            printf("[bm_sd] selftest: total %u/%u bytes mismatch\r\n",
+                   mismatchCount, (unsigned int)BM_SD_BLOCK_SIZE);
             return BM_SD_EIO;
         }
     }

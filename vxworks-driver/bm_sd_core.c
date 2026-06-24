@@ -55,11 +55,13 @@
 #define BM_DSB()   __asm__ __volatile__ (""        ::: "memory")
 #endif
 
-/* 天脉3 平台提供的 DMA 缓冲区 cache 维护接口（已向用户确认函数名与参数），
- * 含义同 bm_emmc_core.c：写卡前 flush 发送缓冲区，读卡完成后 invalidate
- * 接收缓冲区。*/
-extern void ACoreOs_cache_flush(void *addr, unsigned int len);
-extern void ACoreOs_cache_invalidate(void *addr, unsigned int len);
+/* 天脉3 平台提供的 DMA 缓冲区 cache 维护接口（已向用户核实真实签名为
+ * ACoreOs_status_code ACoreOs_cache_flush/invalidate(ACoreOs_cache_types type,
+ * void *pStartAddr, ULONG size)，声明在天脉3 SDK 的 cache.h 里，故此处改为
+ * 包含该头文件，不再自行 extern 声明，含义同 bm_emmc_core.c：写卡前 flush
+ * 发送缓冲区，读卡完成后 invalidate 接收缓冲区。type 统一传 ACOREOS_CACHE_DAT
+ * （数据缓存，本驱动不涉及指令缓存）。*/
+#include "cache.h"
 
 /* 天脉3 平台提供的微秒级延时函数 */
 extern void delay_us(unsigned int time_us);
@@ -76,6 +78,7 @@ extern void delay_us(unsigned int time_us);
 #define SD_SEND_IF_COND           8    /* CMD8  */
 #define SD_SEND_CSD               9    /* CMD9  */
 #define SD_SEND_STATUS            13   /* CMD13 */
+#define SD_STOP_TRANSMISSION      12   /* CMD12，多块传输结束后停止 */
 #define SD_SET_BLOCKLEN           16   /* CMD16 */
 #define SD_READ_SINGLE_BLOCK      17   /* CMD17 */
 #define SD_READ_MULTIPLE_BLOCK    18   /* CMD18 */
@@ -198,6 +201,34 @@ static void bmSdPwrGpioInit(void)
  * 在本文件每次调用前后读一把 PRESENT_STATE/INT_STATUS/ERR_INT_STATUS 原始
  * 寄存器值打出来，失败时就能直接从串口日志看出"卡在哪条命令、卡在哪一步"，
  * 不用再让用户自己去源码里对照行号。确认根因后会整段删除。*/
+/* ERR_INT_STATUS（偏移 0x32）标准位定义，SDHCI 规范 + u-boot include/sdhci.h
+ * 一致，本仓库 bm1684xSdhciHw.h 没有定义这些位，这里按规范本地补一份只用于
+ * 诊断打印 */
+#define SDHCI_ERR_CMD_TIMEOUT   (1U << 0)   /* 命令超时：卡没回应这条命令 */
+#define SDHCI_ERR_CMD_CRC       (1U << 1)
+#define SDHCI_ERR_CMD_END_BIT   (1U << 2)
+#define SDHCI_ERR_CMD_INDEX     (1U << 3)
+#define SDHCI_ERR_DATA_TIMEOUT  (1U << 4)   /* 数据阶段超时：发完命令但数据没传完 */
+#define SDHCI_ERR_DATA_CRC      (1U << 5)
+#define SDHCI_ERR_DATA_END_BIT  (1U << 6)
+#define SDHCI_ERR_CURRENT_LIMIT (1U << 7)
+#define SDHCI_ERR_AUTO_CMD      (1U << 8)
+#define SDHCI_ERR_ADMA          (1U << 9)   /* ADMA 描述符/地址错误 */
+
+static const char *sdDecodeErrSts(u16 errSt)
+{
+    if (errSt & SDHCI_ERR_ADMA)         return "ADMA_ERROR";
+    if (errSt & SDHCI_ERR_AUTO_CMD)     return "AUTO_CMD_ERROR";
+    if (errSt & SDHCI_ERR_DATA_CRC)     return "DATA_CRC_ERROR";
+    if (errSt & SDHCI_ERR_DATA_END_BIT) return "DATA_END_BIT_ERROR";
+    if (errSt & SDHCI_ERR_DATA_TIMEOUT) return "DATA_TIMEOUT_ERROR";
+    if (errSt & SDHCI_ERR_CMD_INDEX)    return "CMD_INDEX_ERROR";
+    if (errSt & SDHCI_ERR_CMD_END_BIT)  return "CMD_END_BIT_ERROR";
+    if (errSt & SDHCI_ERR_CMD_CRC)      return "CMD_CRC_ERROR";
+    if (errSt & SDHCI_ERR_CMD_TIMEOUT)  return "CMD_TIMEOUT_ERROR";
+    return errSt ? "UNKNOWN" : "(none-latched)";
+}
+
 static int sdSendCmdDbg(const char *name, BM1684X_MMC_CMD *pCmd, BM1684X_MMC_DATA *pData)
 {
     int ret = bm1684xSdhciSendCmd(g_dev, pCmd, pData);
@@ -212,19 +243,37 @@ static int sdSendCmdDbg(const char *name, BM1684X_MMC_CMD *pCmd, BM1684X_MMC_DAT
         u16 intSt = *pIntSt;
         u16 errSt = *pErrSt;
         u16 clkCt = *pClkCt;
+        /* 【诊断盲区修复】上面四个是事后实时再读的寄存器：如果 ret 是
+         * BM_ERR_HW，引擎层在返回前已经把 INT_STATUS/ERR_INT_STATUS 清空、
+         * 还调用过 sdhciReset() 把控制器复位回空闲态——这四个值此时已经看
+         * 不出真实出错现场了（一直打印 int=0x0000 err=0x0000、state 是干净
+         * 空闲态，看起来跟"返回了错误"自相矛盾，其实是清错在前、打印在后）。
+         * 真实现场改用引擎层新增的 GetLastIntStatus/GetLastErrStatus 取——
+         * 那是出错那一刻、清空前保存下来的快照。 */
+        u32 latchedInt = bm1684xSdhciGetLastIntStatus(g_dev);
+        u16 latchedErr = (u16)bm1684xSdhciGetLastErrStatus(g_dev);
 
+        /* 新增 arg=/blkCnt=：上一轮日志显示"第一条失败是 ret=-1（真超时，
+         * resp0=0 说明卡在命令阶段），之后全变 ret=-3"，要确认第一条失败的
+         * 是不是格式化时的大块连续写（比如一整簇 128 扇区），LBA(cmdArg)和
+         * 块数缺一不可，之前没打印这两个，看不出来。 */
         printf("[bm_sd] FAIL %s(CMD%u) ret=%d state=0x%08x int=0x%04x err=0x%04x"
-               " clk=0x%04x resp0=0x%08x data=%s inhibit=%s%s clk:%s%s%s\r\n",
+               " clk=0x%04x resp0=0x%08x arg=0x%08x blkCnt=%u data=%s inhibit=%s%s clk:%s%s%s"
+               " latched_int=0x%08x latched_err=0x%04x(%s)\r\n",
                name, (unsigned int)pCmd->cmdIdx, ret,
                (unsigned int)state, (unsigned int)intSt, (unsigned int)errSt,
                (unsigned int)clkCt, (unsigned int)pCmd->resp[0],
+               (unsigned int)pCmd->cmdArg,
+               pData ? pData->blkCount : 0U,
                pData ? (pData->flags & BM1684X_DATA_READ ? "READ" : "WRITE") : "-",
                (state & SDHCI_STATE_CMD_INHIBIT) ? "CMD," : "",
                (state & SDHCI_STATE_DAT_INHIBIT) ? "DAT," : "",
                (clkCt & SDHCI_CLK_INT_EN)     ? "INT_EN," : "INT_EN(0)!,",
                (clkCt & SDHCI_CLK_INT_STABLE) ? "STABLE," : "STABLE(0)!,",
-               (clkCt & SDHCI_CLK_CARD_EN)    ? "CARD_EN" : "CARD_EN(0)!");
-        /* 判断依据：
+               (clkCt & SDHCI_CLK_CARD_EN)    ? "CARD_EN" : "CARD_EN(0)!",
+               (unsigned int)latchedInt, (unsigned int)latchedErr,
+               sdDecodeErrSts(latchedErr));
+        /* 判断依据（旧的四条 state/int/err/clk 判据不变，新加一条）：
          *   - clk 那几位只要有任何一个打出 "(0)!"：说明发命令时 SDCLK 根本没有
          *     真正起来（内部时钟没使能/没稳定/没送到卡），这是比"卡没插好"更
          *     底层的问题——命令字节理论上都没法在总线上完整地发出去，需要回头
@@ -242,7 +291,10 @@ static int sdSendCmdDbg(const char *name, BM1684X_MMC_CMD *pCmd, BM1684X_MMC_DAT
          *     成功，卡在了【数据阶段】（SDMA 一直没等到 XFER_COMPLETE）——
          *     和"命令本身没人理"是完全不同的两类问题，前者要查 DMA/缓冲区，
          *     后者要查总线/卡是否在线。resp0 仍是 0 则说明连命令的响应都没
-         *     拿到，跟数据阶段无关。*/
+         *     拿到，跟数据阶段无关。
+         *   - 【新增】ret=-3(BM_ERR_HW) 时只看 latched_err，不要再看 err= 那个
+         *     实时值（必为 0，已被清空）；latched_err 才是出错那一刻硬件真正
+         *     报的错误类型，括号里直接给出解码后的名字。*/
     }
     return ret;
 }
@@ -276,6 +328,26 @@ static int sdWaitReady(void)
             return BM_SD_ETIMEOUT;
         delay_us(10);
     }
+}
+
+/*--------------------------------------------------------------------------
+ * 多块传输（CMD18/CMD25）结束后发 CMD12 停止传输。
+ * 背景：本驱动之前在传输模式里开了 AUTO_CMD12 让控制器自动收尾，但本颗
+ * Synopsys/比特大陆控制器在 V4 模式下用 AUTO_CMD12 会在命令阶段就报错
+ * （单块写没开 AUTO_CMD12 能过、多块写一开就挂，正是这个差异）。已跑通的
+ * 参考驱动 bm_sd.c【从不用 AUTO_CMD12】，改由上层 mmc 框架在多块传输后显式
+ * 发一条 CMD12。这里照搬：buildXferMode() 去掉 AUTO_CMD12，多块读写收尾时
+ * 由本函数显式发 CMD12。CMD12 是带忙信号的 R1b 响应。
+ *------------------------------------------------------------------------*/
+static int sdStopTransmission(void)
+{
+    BM1684X_MMC_CMD cmd;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.cmdIdx   = SD_STOP_TRANSMISSION;
+    cmd.cmdArg   = 0;
+    cmd.respType = BM1684X_RESP_R1B;
+    return sdSendCmdDbg("CMD12", &cmd, NULL);
 }
 
 /*--------------------------------------------------------------------------
@@ -446,7 +518,22 @@ int bm_sd_init(void)
     ret = sdSendCmdDbg("CMD9", &cmd, NULL);
     if (ret != 0)
         return BM_SD_EIO;
-    csd[0] = cmd.resp[0]; csd[1] = cmd.resp[1]; csd[2] = cmd.resp[2]; csd[3] = cmd.resp[3];
+    /* 【容量算错的根因】R2（136位长响应）在 SDHCI 里存的是去掉了末尾 8 位
+     * CRC 的版本：RESPONSE_0/1/2/3 四个 32 位寄存器装的是 CSD[39:8]/[71:40]/
+     * [103:72]/[127:104]——既低位对齐又比规范整体右移了 8 位。下面套用的容量
+     * 公式（与 u-boot mmc.c 一致）要求 csd[] 是“重组还原后的完整 128 位 CSD、
+     * 且高位在 csd[0]”。之前直接 csd[i]=resp[i] 没还原，等于拿错位的原始字节
+     * 去套公式，于是解出一个接近 2TB 的天文数字（上板日志里的 4241059840 扇区）。
+     * 这里照搬 u-boot drivers/mmc/sdhci.c 的还原写法：逆序 + 左移 8 位补进下一
+     * 个寄存器的最高字节，把 CRC 那 8 位移出去、把规范位号对齐。
+     *   csd[0]=CSD[127:96]  csd[1]=CSD[95:64]  csd[2]=CSD[63:32]  csd[3]=CSD[31:0] */
+    {
+        u32 r0 = cmd.resp[0], r1 = cmd.resp[1], r2 = cmd.resp[2], r3 = cmd.resp[3];
+        csd[0] = (r3 << 8) | (r2 >> 24);
+        csd[1] = (r2 << 8) | (r1 >> 24);
+        csd[2] = (r1 << 8) | (r0 >> 24);
+        csd[3] = (r0 << 8);
+    }
 
     {
         u64 csize, cmult, capacityBytes;
@@ -526,6 +613,16 @@ int bm_sd_read_blocks(u32 lba, u32 count, void *buf)
     if ((count == 0U) || (buf == NULL))
         return BM_SD_EPARAM;
 
+    /* 读卡前也要先 invalidate 接收缓冲区：参考驱动 bm_sd_prepare() 对读写
+     * 都无条件先做一次 flush_dcache_range()，不是只在写方向做。本驱动之前
+     * 只在"读完之后"invalidate 一次，漏了"读之前"这一次——如果 rbuf 之前
+     * 残留了缓存里的旧内容（哪怕是干净页、未必是脏页），DMA 写入期间该缓存行
+     * 一直有效，读完后再 invalidate 本应能强制重新取数；但实测板上复现出
+     * "读命令成功、字节0却是旧值0x00"，跟"读前没清缓存"这一类问题的典型现
+     * 象一致，按参考驱动的双向都清的口径补上更保险。*/
+    ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, buf, count * BM_SD_BLOCK_SIZE);
+    BM_DSB();
+
     memset(&data, 0, sizeof(data));
     data.buf = buf; data.blkSize = BM_SD_BLOCK_SIZE; data.blkCount = count;
     data.flags = BM1684X_DATA_READ;
@@ -541,10 +638,19 @@ int bm_sd_read_blocks(u32 lba, u32 count, void *buf)
     if (ret != 0)
         return BM_SD_EIO;
 
+    /* 多块读(CMD18)是开放式命令，传完要显式发 CMD12 停止（不再靠 AUTO_CMD12）。
+     * 单块读(CMD17)自带终止，不需要 CMD12。*/
+    if (count > 1U)
+    {
+        ret = sdStopTransmission();
+        if (ret != 0)
+            return BM_SD_EIO;
+    }
+
     /* DMA 完成后先 dsb 排序，再 invalidate 接收缓冲区，强制 CPU 重新从内存
      * 读取 DMA 刚写入的数据，避免读到缓存里的旧值（与 eMMC 版本相同处理）。*/
     BM_DSB();
-    ACoreOs_cache_invalidate(buf, count * BM_SD_BLOCK_SIZE);
+    ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, buf, count * BM_SD_BLOCK_SIZE);
     return BM_SD_OK;
 }
 
@@ -569,7 +675,7 @@ int bm_sd_write_blocks(u32 lba, u32 count, const void *buf)
     /* 写卡前 flush 发送缓冲区，把 CPU 缓存里的最新数据刷到内存，DMA 才能
      * 读到正确内容；flush 后补一道 dsb，保证这件事排在引擎层启动 DMA 的
      * 寄存器写之前完成（与 eMMC 版本相同处理）。*/
-    ACoreOs_cache_flush((void *)buf, count * BM_SD_BLOCK_SIZE);
+    ACoreOs_cache_flush(ACOREOS_CACHE_DAT, (void *)buf, count * BM_SD_BLOCK_SIZE);
     BM_DSB();
 
     memset(&data, 0, sizeof(data));
@@ -584,6 +690,15 @@ int bm_sd_write_blocks(u32 lba, u32 count, const void *buf)
     ret = sdSendCmdDbg("WRITE", &cmd, &data);
     if (ret != 0)
         return BM_SD_EIO;
+
+    /* 多块写(CMD25)是开放式命令，传完要显式发 CMD12 停止（不再靠 AUTO_CMD12）。
+     * 单块写(CMD24)自带终止，不需要 CMD12。*/
+    if (count > 1U)
+    {
+        ret = sdStopTransmission();
+        if (ret != 0)
+            return BM_SD_EIO;
+    }
 
     /* 等卡内部编程完成，确保数据落盘 */
     return sdWaitReady();

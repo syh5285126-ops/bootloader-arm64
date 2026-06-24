@@ -153,6 +153,15 @@ void bm1684xSdhciIsr(BM1684X_SDHCI_DEV *pDev);
  */
 int bm1684xSdhciCardPresent(BM1684X_SDHCI_DEV *pDev);
 
+/*
+ * 取最近一次 bm1684xSdhciSendCmd() 失败时刻、清空前捕获到的原始状态：
+ *   GetLastIntStatus  – INT_STATUS | (ERR_INT_STATUS << 16)
+ *   GetLastErrStatus  – 仅 ERR_INT_STATUS（具体哪类硬件错误）
+ * 失败后立即调用才有意义，下一次 SendCmd 会覆盖。
+ */
+unsigned int bm1684xSdhciGetLastIntStatus(BM1684X_SDHCI_DEV *pDev);
+unsigned int bm1684xSdhciGetLastErrStatus(BM1684X_SDHCI_DEV *pDev);
+
 #ifdef __cplusplus
 }
 #endif
