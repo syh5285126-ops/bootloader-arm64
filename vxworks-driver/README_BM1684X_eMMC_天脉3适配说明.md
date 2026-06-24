@@ -776,3 +776,103 @@ PHY/共用引擎层的寄存器细节。**这只是预案，等下一份日志�
 
 **下一步**：用新代码重新上板跑文件系统初始化/格式化，看大块写（`blkCnt=1024`）是否还失败。
 若过了即坐实根因；若仍失败，上兜底的"按边界切块"方案。
+
+### 15.6 上板验证：格式化阶段问题已解决，根因是 eMMC 多块传输缺 CMD12 + 读路径缺读前 cache invalidate
+15.5 的 `ADMA_SA_HIGH` 修复生效后，格式化仍有报错，进一步排查发现 `bm_emmc_core.c` 比
+`bm_sd_core.c` 落后了两处，均已修复并上板验证通过：
+
+1. **缺 CMD12 停止传输**：共用引擎层 `buildXferMode()` 早已改成多块传输不再用 `AUTO_CMD12`
+   （V4 模式下控制器在命令阶段就报错），要求上层在多块读写(CMD18/CMD25)完成后显式发一条
+   CMD12。SD 版本之前已经补了（`sdStopTransmission()`），但 eMMC 版本当时没同步改，单块
+   读写没事、格式化的大块连续写传完后 DAT 线一直占着，紧跟的命令发不出去而失败。已在
+   `bm_emmc_core.c` 新增 `mmcStopTransmission()`，在 `bm_emmc_read_blocks`/
+   `bm_emmc_write_blocks` 里 `count > 1` 时调用，与 SD 版本对齐。
+2. **读路径缺读前 cache invalidate**：`bm_sd_read_blocks()` 在发起 DMA 读之前就先对接收缓冲区
+   做一次 `invalidate`（不是只在读完之后做）——防止缓冲区里残留的旧缓存行在 DMA 写入期间仍
+   被命中，导致读完后 CPU 读到旧值。`bm_emmc_read_blocks()` 之前只在读完后做了一次，已补上
+   读前这一次，逻辑与 SD 版本对齐。
+3. 顺带把 SD 版本已有的诊断打印包装（`sdSendCmdDbg()`）搬到 eMMC（`mmcSendCmdDbg()`），
+   之前 eMMC 命令失败时只返回错误码、没有任何寄存器现场信息，排障效率低。
+
+**结论**：eMMC 这条线截至本节，selftest + 格式化均已上板验证通过。后续若再出问题，优先确认
+是否是引擎层共用代码的改动（任何引擎层修复都要同时检查 eMMC/SD 两份核心层是否同步跟进）。
+
+## 十六、CLAUDE.md 精简归档：原始排障时间线（逐条记录，未删减）
+CLAUDE.md 之前直接堆了一份逐轮排障的流水账，导致文件越写越大、每次对话都要重新加载。本节是
+**原文原样搬运**的归档，CLAUDE.md 里只保留最新结论，完整推理过程留在这里供回溯。
+
+### eMMC 排障历程（早期，已解决，结论见本文件十五.6）
+eMMC 读写一开始一直未成功（`write fail -1`，解码后 `BM_ERR_HW` 对应真实根因是 ERR_INT_STATUS
+bit0 "Command Timeout Error"；读也不正常，从未成功写进过），根因当时没有定位，排障被用户暂时
+搁置（"先不纠结这个"），转而要求新增 SD 卡版本驱动作为另一条独立验证路径。后续 SD 排障过程中
+发现并修的几个共用引擎层问题（AUTO_CMD12、等待忙位口径、SDMA 512KB 边界 ADMA_SA_HIGH）回头
+看大概率与早期 eMMC 卡死同根同源；eMMC 这条线最终在十五.6 修复验证通过。
+
+### SD 卡驱动排障历程（`bm_sd_*`，与 eMMC 版本二选一编译）
+用户要求"把驱动改为 SD 卡的驱动，具体细节以 uboot 为准"——逐条照搬 `u-boot/drivers/mmc/mmc.c`
+里 SD 专属协议函数（`mmc_go_idle`/`mmc_send_if_cond`/`sd_send_op_cond`/`mmc_startup` 的 SD
+分支/`sd_select_bus_width`）改写卡识别时序。
+
+- 新增文件（`vxworks-driver/`，与 eMMC 版本一一对应）：`bm_sd_core.c`、`bm_sd_glue.c`、
+  `bm_sd_osal_os3.c/.h`、`bm_sd.h`、`bm_sd_types.h`、`bm_sd_glue_cfg.h`（总开关宏
+  `BM1684X_SD`）。
+- `bm_sd_glue.c` 与 `bm_emmc_glue.c` 提供的符号名完全相同（`AcoreOs_fmsh_sdmmc_init`/
+  `emmc_rd_sect0_2`/`bm_emmc_get_block_count` 等），让 `fatBlkDrvDemo_os3.c` 不改代码即可
+  切换底层介质——但两套文件不能同时参与编译，二选一时另一套要在天脉 IDE 工程里排除掉。
+- 与 eMMC 版本的实质性差异（SD 协议本身的规则）：CMD8+ACMD41 取代 CMD1；RCA 由卡自己上报
+  （不是主机指定）；容量来自 CMD9 的 CSD 寄存器解析（SD 没有 EXT_CSD）；总线位宽切换用
+  ACMD6；SD 卡可插拔，初始化前用 `bm1684xSdhciCardPresent()` 查卡在位（查不到返回新增的
+  `BM_SD_ENOCARD`）。控制器/PHY 层走引擎层 `bm1684xSdhci.c` 里 `devIndex==1` 的现成 SD 分支，
+  未改引擎层代码。
+- **命名陷阱**：`sdhci-bitmain.c` 的 `bm_sdhci_probe()` 给 `EMMC_CTRL_R` bit0（命名
+  `CARD_IS_EMMC`）置位是不分 index、无条件对所有设备执行的，SD 通道也一样设置——名字带
+  "EMMC"但 U-Boot 真实代码并不只给 eMMC 设。`bm_sd_core.c` 里照样替 SD 通道补了这一位。
+- 上板自检入口：`bm_sd_selftest(lba)`（`bm_sd_glue.c` 里）。
+- 尚未验证的假设：SD 卡 CSD 的 `READ_BL_LEN` 假设为 512B；CMD8 超时（老 SD 1.x 卡）的回退
+  路径写了但未实测。
+- **供电 GPIO 缺失（已修）**：插着卡仍报 `init fail -5`（`BM_SD_ENOCARD`）。根因是 BM1684X
+  的 SD 卡槛除了 SDHCI 标准供电寄存器外，还有独立的板级供电开关 GPIO（`SDIO_PWR_EN`，对照
+  设备树 `pwr-gpio = <&port1a 10>` 与 `u-boot/drivers/mmc/sdhci.c`，寄存器基址 `0x50027400`
+  bit10）——没驱动它卡槛根本没电。已在 `bm_sd_core.c` 新增 `bmSdPwrGpioInit()` 补上。
+- **改"软检测"**：补供电后仍报 `-5`，卡检测位读不到 1 的问题没解决，已把硬性
+  `return BM_SD_ENOCARD` 改成轮询约 1s + 告警后继续走识别流程。
+- **定位到 `-1`**：软检测绕开卡检测后，错误码变成 `-1`，定位在 `bm1684xSdhciSendCmd()` 内部，
+  不知道是哪条命令超时。已加临时排障代码 `sdSendCmdDbg()`，失败时打印命令号+寄存器原始值。
+- **CMD8 超时，pad mux 缺口**：交叉核对 `u-boot/board/bitmain/bm1684/board.c` 的
+  `pinmux_config(PINMUX_SDIO)` 发现驱动 `SDIO_PWR_EN` GPIO 之前，u-boot 还先在顶层 pad mux
+  （`PINMUX_BASE(0x50010400)+0x28` bit[5:4]=`0x1`）把这颗引脚选成"GPIO"功能——之前两版都漏
+  了。已在 `bmSdPwrGpioInit()` 补上。
+- **上板验证：pad mux 补丁未解决问题，CMD8 依旧超时**，供电这条线查到头，换方向排查。
+- **PHY 参数根因**：引擎层 `bm1684xSdhci.c` 的 `phyInit()` 里 PHY 信号 pad 电气参数和延迟线
+  模式写错了。用户提供的第三方天脉3 SD 驱动 + 本仓库 TF-A 真实参考两个独立来源对
+  CMD/DAT/CLK/STB/RST 几个 pad 的 `RXSEL`/`TXSLEW_CTRL_P/N` 用的是同一组值，且都跟引擎层原值
+  不同；`SDCLKDL_CNFG`/`ATDL_CNFG` 该用"固定延迟"模式，引擎层原来错选成了"旁路"。已直接改在
+  `bm1684xSdhci.c`（共用引擎层）。中断号已确认 SD=46/唤醒=45，暂未应用（仍轮询模式）。
+- **上板验证：PHY 修复生效，`init` 成功**——CMD8 不再超时，卡识别+容量解析全部走通。新问题：
+  `init` 成功后 selftest 写成功、读失败（`read fail -1`）。已把读/写也接入排障打印。
+- **超时控制寄存器缺口**：标准 SDHCI"超时控制"寄存器（偏移 `0x2E`）参考驱动和
+  `vxbBm1684xSdhci.c` 都主动写成最大值 `0x0E`，引擎层从未碰过。已补上，低风险。
+- **真根因：`sdWaitReady()` 给出"假就绪"**：日志显示 DAT 忙位仍是 1、硬件零报错、命令响应
+  寄存器是空的——CMD17（读）根本没发到总线上。原引擎层等待总线忙位清除的逻辑，原来只在"带
+  数据"或"带忙信号响应"的命令上才等 DAT 忙位；u-boot 真实代码对几乎所有命令（除停止传输命令
+  外）都同时等 CMD+DAT 两个忙位，包括 CMD13。写完一块后 `sdWaitReady()` 靠轮询 CMD13 判断
+  "卡是否空闲"，但 CMD13 没等 DAT 忙位，提前放行，紧接着的读命令发现真正的忙位还在，超时。
+  已修复成跟 u-boot 一致的口径。
+- **超时时长问题**：上一条修复让 CMD13 也开始等 DAT 忙位后，写失败报错落在 CMD13，原因是等待
+  超时留的是旧值（写死 100ms），u-boot 是从 100ms 起步翻倍重试到 3.2 秒才放弃。已把超时改成
+  3.2 秒（`SDHCI_INHIBIT_TIMEOUT_US`）。
+- **3.2s 超时后 CMD13 仍超时**：反而推翻"卡需更多时间"。日志 `state=0x03f70106`
+  （DAT_INHIBIT=1、Write Transfer Active=1，但 DAT0 电平=高即卡已不忙）、`err=0x0000`、
+  `resp0=0`（CMD13 没发出去）。真病根：写完一块后控制器 DAT 线没释放，等再久也没用。前两次
+  改动只是把症状在 CMD17/CMD13 之间搬来搬去，已纠正方向。
+- **回到第三方参考驱动逐行比对，三处改动（最新结论）**：
+  ① CMD13 这类纯命令不该等 DAT 忙位——参考驱动里不带数据的命令只等 `CMD_INHIBIT`，带数据的
+  才等 `CMD_INHIBIT|DAT_INHIBIT`，已改回（`if(pData||respType==R1B)` 才加 DAT 忙位）。
+  ② 真正病根大概率在传输模式——参考驱动读/写一律带 `TRNS_MULTI`（单块也带），原来只在多块时
+  带。本颗 Synopsys/比特大陆控制器特性：单块模式写完后控制器 DAT 忙位疑似清不干净。已照搬
+  单块也置 MULTI，AUTO_CMD12 仅多块用（⚠与严格"以 u-boot 为准"冲突，按本板已跑通的参考驱动
+  为准）。
+  ③ 顺带补齐：发每条命令前把 `INT_STATUS/ERR_INT_STATUS` 整清 `0xFFFF`，防残留状态位误判。
+  三处都在共用引擎层 `bm1684xSdhci.c`。
+- 后续 SD 上板验证结果、本节之后的新发现，按惯例继续追加在本文件对应章节（不再回写
+  CLAUDE.md）。
