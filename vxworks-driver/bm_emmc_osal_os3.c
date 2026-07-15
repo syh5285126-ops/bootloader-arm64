@@ -52,8 +52,38 @@ static void bmOs3MemFree(void *ptr)
     free(ptr);
 }
 
+/*
+ * 天脉3工程可用 BSP/RTOS mutex 覆盖这三个弱符号。
+ * 默认返回 NULL，core 会退到原子锁兜底；产品形态建议接真 mutex。
+ */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void *bmOs3EmmcMutexCreate(void)
+{
+    return NULL;
+}
+
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+int bmOs3EmmcMutexLock(void *mutex, unsigned int timeoutMs)
+{
+    (void)mutex;
+    (void)timeoutMs;
+    return -1;
+}
+
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void bmOs3EmmcMutexUnlock(void *mutex)
+{
+    (void)mutex;
+}
+
 /*--------------------------------------------------------------------------
- * 中断号未核实（CLAUDE.md 已记录为非阻塞缺口），sem_*/irq_* 回调全部留空，
+ * 中断号未核实（CLAUDE.md 已记录为非阻塞缺口），sem_xxx/irq_xxx 回调全部留空，
  * 引擎层检测到这些回调为 NULL 会自动走纯轮询模式，先求稳跑通；
  * 中断号确认后，把 sem_create/sem_wait/sem_signal/irq_connect/irq_enable
  * 接到天脉3 对应的信号量/中断 API 即可切换到中断模式提速。
@@ -68,6 +98,9 @@ const BM1684X_SDHCI_OSAL g_bm1684xOsalOs3 = {
     NULL,           /* irq_enable  */
     bmOs3MemAlloc,  /* mem_alloc   */
     bmOs3MemFree,   /* mem_free    */
+    bmOs3EmmcMutexCreate, /* mutex_create */
+    bmOs3EmmcMutexLock,   /* mutex_lock   */
+    bmOs3EmmcMutexUnlock, /* mutex_unlock */
 };
 
 #endif /* BM1684X_EMMC */

@@ -61,6 +61,15 @@ typedef struct {
      */
     void *(*mem_alloc)(unsigned int size);
     void  (*mem_free)(void *ptr);
+
+    /*
+     * Controller-wide mutex for RTOS/SMP callers. This is separate from
+     * sem_* above: sem_* only waits for command completion; this mutex
+     * serializes full read/write/init transactions across cores.
+     */
+    void *(*mutex_create)(void);
+    int   (*mutex_lock)(void *mutex, unsigned int timeout_ms);
+    void  (*mutex_unlock)(void *mutex);
 } BM1684X_SDHCI_OSAL;
 
 /* --------------------------------------------------------------------------

@@ -113,11 +113,108 @@ static u32 g_blockCount  = 0;       /* 用户区总扇区数（512B/扇区） */
 /* EXT_CSD 读缓冲（512B），静态避免占栈，且地址固定方便 cache 维护 */
 static u8 g_extCsd[512];
 
+#ifndef BM_EMMC_LOCK_TIMEOUT_MS
+#define BM_EMMC_LOCK_TIMEOUT_MS 60000U
+#endif
+
+static void *g_ioMutex = NULL;
+static int g_ioLockReady = 0;
+static int g_ioLockUseMutex = 0;
+static volatile int g_ioLockInitBusy = 0;
+static volatile int g_ioSpinBusy = 0;
+
+static int bmAtomicTryLock(volatile int *lock)
+{
+#if defined(__GNUC__)
+    return __sync_lock_test_and_set(lock, 1) == 0;
+#else
+    if (*lock)
+        return 0;
+    *lock = 1;
+    return 1;
+#endif
+}
+
+static void bmAtomicUnlock(volatile int *lock)
+{
+#if defined(__GNUC__)
+    __sync_lock_release(lock);
+#else
+    *lock = 0;
+#endif
+}
+
+static int bmEmmcSpinLock(volatile int *lock, u32 timeoutMs)
+{
+    u32 left = timeoutMs * 100U; /* 10us per retry */
+
+    while (!bmAtomicTryLock(lock))
+    {
+        if (left-- == 0U)
+            return BM_EMMC_ETIMEOUT;
+        delay_us(10);
+    }
+    return BM_EMMC_OK;
+}
+
+static int bmEmmcEnsureIoLock(void)
+{
+    if (g_ioLockReady)
+        return BM_EMMC_OK;
+
+    if (bmEmmcSpinLock(&g_ioLockInitBusy, BM_EMMC_LOCK_TIMEOUT_MS) != BM_EMMC_OK)
+        return BM_EMMC_ETIMEOUT;
+
+    if (!g_ioLockReady)
+    {
+        if (g_bm1684xOsalOs3.mutex_create != NULL &&
+            g_bm1684xOsalOs3.mutex_lock   != NULL &&
+            g_bm1684xOsalOs3.mutex_unlock != NULL)
+        {
+            g_ioMutex = g_bm1684xOsalOs3.mutex_create();
+            if (g_ioMutex != NULL)
+                g_ioLockUseMutex = 1;
+        }
+
+        if (!g_ioLockUseMutex)
+        {
+            /* ponytail: atomic fallback, replace with RTOS mutex if wait latency matters. */
+            printf("[bm_emmc] OS mutex not hooked, use atomic fallback lock\r\n");
+        }
+        g_ioLockReady = 1;
+    }
+
+    bmAtomicUnlock(&g_ioLockInitBusy);
+    return BM_EMMC_OK;
+}
+
+static int bmEmmcIoLock(void)
+{
+    int ret = bmEmmcEnsureIoLock();
+
+    if (ret != BM_EMMC_OK)
+        return ret;
+
+    if (g_ioLockUseMutex)
+        return (g_bm1684xOsalOs3.mutex_lock(g_ioMutex, BM_EMMC_LOCK_TIMEOUT_MS) == 0)
+               ? BM_EMMC_OK : BM_EMMC_ETIMEOUT;
+
+    return bmEmmcSpinLock(&g_ioSpinBusy, BM_EMMC_LOCK_TIMEOUT_MS);
+}
+
+static void bmEmmcIoUnlock(void)
+{
+    if (g_ioLockUseMutex)
+        g_bm1684xOsalOs3.mutex_unlock(g_ioMutex);
+    else
+        bmAtomicUnlock(&g_ioSpinBusy);
+}
+
 /*--------------------------------------------------------------------------
  * TOP 域时钟使能 + 软复位：与 TF-A bm_clock.h（GATE_CLK_EMMC_200M/AXI_EMMC/
  * 100K_EMMC）、platform_def.h（BIT_MASK_TOP_SOFT_RST0_EMMC=BIT(20)）、
  * U-Boot reset-bitmain.c（assert→deassert 复位手法）三处比对核实过的位定义
- * 一致（均已在 bm1684xSdhciHw.h 里定义为 BM1684X_CLK_*/BM1684X_RST_EMMC）。
+ * 一致（均已在 bm1684xSdhciHw.h 里定义为 BM1684X_CLK_xxx/BM1684X_RST_EMMC）。
  *
  * 为什么需要这一步：TF-A 的 bm_sd.c、U-Boot 的 sdhci-bitmain.c 都从来没有
  * 显式调用这两个寄存器——因为它们只在"eMMC 是引导介质"的场景下运行，BootROM
@@ -302,7 +399,7 @@ static u32 lbaToArg(u32 lba)
 /*--------------------------------------------------------------------------
  * 初始化：控制器（含 PHY/时钟）+ eMMC 卡识别
  *------------------------------------------------------------------------*/
-int bm_emmc_init(void)
+static int bm_emmc_init_locked(void)
 {
     BM1684X_MMC_CMD  cmd;
     BM1684X_MMC_DATA data;
@@ -431,11 +528,30 @@ int bm_emmc_init(void)
     return BM_EMMC_OK;
 }
 
+int bm_emmc_init(void)
+{
+    int ret = bmEmmcIoLock();
+
+    if (ret != BM_EMMC_OK)
+        return ret;
+
+    ret = bm_emmc_init_locked();
+    bmEmmcIoUnlock();
+    return ret;
+}
+
 int bm_emmc_reinit(void)
 {
+    int ret = bmEmmcIoLock();
+
+    if (ret != BM_EMMC_OK)
+        return ret;
+
     g_inited     = 0;
     g_blockCount = 0;
-    return bm_emmc_init();
+    ret = bm_emmc_init_locked();
+    bmEmmcIoUnlock();
+    return ret;
 }
 
 /*--------------------------------------------------------------------------
@@ -445,16 +561,21 @@ int bm_emmc_read_blocks(u32 lba, u32 count, void *buf)
 {
     BM1684X_MMC_CMD  cmd;
     BM1684X_MMC_DATA data;
-    int ret;
+    int ret = BM_EMMC_OK;
+
+    if ((count == 0U) || (buf == NULL))
+        return BM_EMMC_EPARAM;
+
+    ret = bmEmmcIoLock();
+    if (ret != BM_EMMC_OK)
+        return ret;
 
     if (!g_inited)
     {
-        ret = bm_emmc_init();
+        ret = bm_emmc_init_locked();
         if (ret != BM_EMMC_OK)
-            return ret;
+            goto out;
     }
-    if ((count == 0U) || (buf == NULL))
-        return BM_EMMC_EPARAM;
 
     /* 读卡前也要先 invalidate 接收缓冲区（与 bm_sd_read_blocks 保持一致）：
      * 参考驱动 bm_sd_prepare() 对读写都无条件先做一次缓存维护，不是只在读完
@@ -476,7 +597,10 @@ int bm_emmc_read_blocks(u32 lba, u32 count, void *buf)
 
     ret = mmcSendCmdDbg("READ", &cmd, &data);
     if (ret != 0)
-        return BM_EMMC_EIO;
+    {
+        ret = BM_EMMC_EIO;
+        goto out;
+    }
 
     /* 多块读(CMD18)是开放式命令，传完要显式发 CMD12 停止（引擎层不再用
      * AUTO_CMD12，与 bm_sd_read_blocks 一致）。单块读(CMD17)自带终止，
@@ -485,7 +609,10 @@ int bm_emmc_read_blocks(u32 lba, u32 count, void *buf)
     {
         ret = mmcStopTransmission();
         if (ret != 0)
-            return BM_EMMC_EIO;
+        {
+            ret = BM_EMMC_EIO;
+            goto out;
+        }
     }
 
     /* 先补一道 dsb，确保"引擎层已观察到 DMA 传输完成"（最后那次 Device 状态寄存器
@@ -493,7 +620,11 @@ int bm_emmc_read_blocks(u32 lba, u32 count, void *buf)
      * 然后 invalidate 接收缓冲区，强制 CPU 重新从内存读取 DMA 刚写入的数据。*/
     BM_DSB();
     ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, buf, count * BM_EMMC_BLOCK_SIZE);
-    return BM_EMMC_OK;
+    ret = BM_EMMC_OK;
+
+out:
+    bmEmmcIoUnlock();
+    return ret;
 }
 
 /*--------------------------------------------------------------------------
@@ -503,16 +634,21 @@ int bm_emmc_write_blocks(u32 lba, u32 count, const void *buf)
 {
     BM1684X_MMC_CMD  cmd;
     BM1684X_MMC_DATA data;
-    int ret;
+    int ret = BM_EMMC_OK;
+
+    if ((count == 0U) || (buf == NULL))
+        return BM_EMMC_EPARAM;
+
+    ret = bmEmmcIoLock();
+    if (ret != BM_EMMC_OK)
+        return ret;
 
     if (!g_inited)
     {
-        ret = bm_emmc_init();
+        ret = bm_emmc_init_locked();
         if (ret != BM_EMMC_OK)
-            return ret;
+            goto out;
     }
-    if ((count == 0U) || (buf == NULL))
-        return BM_EMMC_EPARAM;
 
     /* 写卡前对发送缓冲区 flush，把 CPU 缓存里的最新数据刷到内存，DMA 才能读到正确内容。
      * flush 之后补一道 dsb：保证"数据落内存"这件事，排在后面引擎层启动 DMA 的寄存器
@@ -532,7 +668,10 @@ int bm_emmc_write_blocks(u32 lba, u32 count, const void *buf)
 
     ret = mmcSendCmdDbg("WRITE", &cmd, &data);
     if (ret != 0)
-        return BM_EMMC_EIO;
+    {
+        ret = BM_EMMC_EIO;
+        goto out;
+    }
 
     /* 多块写(CMD25)是开放式命令，传完要显式发 CMD12 停止（引擎层不再用
      * AUTO_CMD12，与 bm_sd_write_blocks 一致）。单块写(CMD24)自带终止，
@@ -542,16 +681,29 @@ int bm_emmc_write_blocks(u32 lba, u32 count, const void *buf)
     {
         ret = mmcStopTransmission();
         if (ret != 0)
-            return BM_EMMC_EIO;
+        {
+            ret = BM_EMMC_EIO;
+            goto out;
+        }
     }
 
     /* 等卡内部编程完成，确保数据落盘 */
-    return mmcWaitReady();
+    ret = mmcWaitReady();
+
+out:
+    bmEmmcIoUnlock();
+    return ret;
 }
 
 u32 bm_emmc_get_block_count(void)
 {
-    return g_blockCount;
+    u32 n;
+
+    if (bmEmmcIoLock() != BM_EMMC_OK)
+        return 0;
+    n = g_blockCount;
+    bmEmmcIoUnlock();
+    return n;
 }
 
 #endif /* BM1684X_EMMC */

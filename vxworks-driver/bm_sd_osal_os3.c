@@ -50,7 +50,7 @@ static void bmOs3SdMemFree(void *ptr)
 }
 
 /*--------------------------------------------------------------------------
- * 中断号未核实，sem_*/irq_* 回调全部留空，引擎层检测到这些回调为 NULL 会
+ * 中断号未核实，sem_xxx/irq_xxx 回调全部留空，引擎层检测到这些回调为 NULL 会
  * 自动走纯轮询模式，先求稳跑通；中断号确认后再接到天脉3 对应 API。
  *------------------------------------------------------------------------*/
 const BM1684X_SDHCI_OSAL g_bm1684xOsalOs3Sd = {
@@ -63,6 +63,9 @@ const BM1684X_SDHCI_OSAL g_bm1684xOsalOs3Sd = {
     NULL,             /* irq_enable  */
     bmOs3SdMemAlloc,  /* mem_alloc   */
     bmOs3SdMemFree,   /* mem_free    */
+    NULL,             /* mutex_create */
+    NULL,             /* mutex_lock   */
+    NULL,             /* mutex_unlock */
 };
 
 #endif /* BM1684X_SD */

@@ -11,4 +11,9 @@
 
 extern const BM1684X_SDHCI_OSAL g_bm1684xOsalOs3;
 
+/* Optional BSP overrides for SMP-safe eMMC access. lock returns 0 on success. */
+void *bmOs3EmmcMutexCreate(void);
+int   bmOs3EmmcMutexLock(void *mutex, unsigned int timeoutMs);
+void  bmOs3EmmcMutexUnlock(void *mutex);
+
 #endif /* _BM_EMMC_OSAL_OS3_H_ */
