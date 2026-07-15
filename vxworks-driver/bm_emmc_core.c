@@ -196,8 +196,7 @@ static int bmEmmcIoLock(void)
         return ret;
 
     if (g_ioLockUseMutex)
-        return (g_bm1684xOsalOs3.mutex_lock(g_ioMutex, BM_EMMC_LOCK_TIMEOUT_MS) == 0)
-               ? BM_EMMC_OK : BM_EMMC_ETIMEOUT;
+        return (g_bm1684xOsalOs3.mutex_lock(g_ioMutex) == 0) ? BM_EMMC_OK : BM_EMMC_EIO;
 
     return bmEmmcSpinLock(&g_ioSpinBusy, BM_EMMC_LOCK_TIMEOUT_MS);
 }

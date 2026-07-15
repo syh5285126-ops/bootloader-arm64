@@ -67,10 +67,9 @@ void *bmOs3EmmcMutexCreate(void)
 #if defined(__GNUC__)
 __attribute__((weak))
 #endif
-int bmOs3EmmcMutexLock(void *mutex, unsigned int timeoutMs)
+int bmOs3EmmcMutexLock(void *mutex)
 {
     (void)mutex;
-    (void)timeoutMs;
     return -1;
 }
 

@@ -128,7 +128,7 @@ bm_emmc_write_blocks()
 
 ```c
 void *(*mutex_create)(void);
-int   (*mutex_lock)(void *mutex, unsigned int timeout_ms);
+int   (*mutex_lock)(void *mutex);
 void  (*mutex_unlock)(void *mutex);
 ```
 
@@ -157,17 +157,17 @@ unlock
 
 `bm_emmc_reinit()` 必须独占执行，并阻止其他读写同时进入。
 
-### 5.5 返回与超时策略
+### 5.5 返回策略
 
-建议 mutex lock 使用有限超时，例如 30s 或 60s。
+如果 RTOS mutex API 不支持超时，OSAL 的 `mutex_lock` 不传超时参数，按 RTOS 原生阻塞语义执行。
 
-超时返回：
+返回建议：
 
-- `BM_EMMC_ETIMEOUT`：拿锁超时
-- `BM_EMMC_EIO`：命令/DMA/控制器错误
+- `BM_EMMC_EIO`：RTOS mutex lock/unlock 对接失败或命令/DMA/控制器错误
+- `BM_EMMC_ETIMEOUT`：仅用于内部原子兜底锁等待超时或 eMMC 命令超时
 - `BM_EMMC_EPARAM`：参数错误
 
-不要无限等待，避免一个异常 I/O 导致所有访问永久挂死且无法定位。
+正式产品应接 RTOS mutex；内部原子兜底只用于 BSP mutex 未接入阶段，仍保留有限等待，避免兜底路径永久挂死。
 
 ## 6. 建议修改点
 
@@ -183,7 +183,7 @@ unlock
 
 ```c
 static void *bmOs3EmmcMutexCreate(void);
-static int bmOs3EmmcMutexLock(void *mutex, unsigned int timeoutMs);
+static int bmOs3EmmcMutexLock(void *mutex);
 static void bmOs3EmmcMutexUnlock(void *mutex);
 ```
 
@@ -280,4 +280,4 @@ static int bm_emmc_init_locked(void);
 - `bm_emmc_core.c`：`init`、`reinit`、`read`、`write`、`get_block_count` 统一走 eMMC I/O 锁。
 - `bm_sd_osal_os3.c`：补齐新增 OSAL 字段为 `NULL`，保持 SD 路径行为不变。
 
-当前实现优先使用 BSP/RTOS mutex；未对接时使用带超时的原子锁兜底。产品集成时建议覆盖 `bmOs3EmmcMutexCreate()`、`bmOs3EmmcMutexLock()`、`bmOs3EmmcMutexUnlock()` 接入真实 RTOS mutex。
+当前实现优先使用 BSP/RTOS mutex；RTOS mutex lock 按原生阻塞语义执行，不传 timeout。未对接时使用带超时的原子锁兜底。产品集成时建议覆盖 `bmOs3EmmcMutexCreate()`、`bmOs3EmmcMutexLock()`、`bmOs3EmmcMutexUnlock()` 接入真实 RTOS mutex。

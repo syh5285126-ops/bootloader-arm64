@@ -68,7 +68,7 @@ typedef struct {
      * serializes full read/write/init transactions across cores.
      */
     void *(*mutex_create)(void);
-    int   (*mutex_lock)(void *mutex, unsigned int timeout_ms);
+    int   (*mutex_lock)(void *mutex);
     void  (*mutex_unlock)(void *mutex);
 } BM1684X_SDHCI_OSAL;
 
