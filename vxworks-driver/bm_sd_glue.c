@@ -166,4 +166,64 @@ int bm_sd_selftest(u32 test_lba)
     return BM_SD_OK;
 }
 
+/*--------------------------------------------------------------------------
+ * 多核互斥验证 demo
+ *
+ * 用法：
+ *   核A 的任务里跑 lock_demo_writer_A(sector, 200)
+ *   核B 的任务里跑 lock_demo_writer_B(sector, 200)
+ *   两个任务都结束后跑 lock_demo_verify(sector)
+ *
+ * 原理：两个核对同一扇区反复写不同 pattern（0xAA vs 0x55，每位相反）。
+ *       有锁 → 扇区全是一种 pattern。没锁 → 两种混在一起。
+ *------------------------------------------------------------------------*/
+void lock_demo_writer_A(u32 lba, int repeat)
+{
+	u8 buf[BM_SD_BLOCK_SIZE];
+	memset(buf, 0xAA, sizeof(buf));
+	while (repeat-- > 0)
+		bm_sd_write_blocks(lba, 1U, buf);
+}
+
+void lock_demo_writer_B(u32 lba, int repeat)
+{
+	u8 buf[BM_SD_BLOCK_SIZE];
+	memset(buf, 0x55, sizeof(buf));
+	while (repeat-- > 0)
+		bm_sd_write_blocks(lba, 1U, buf);
+}
+
+int lock_demo_verify(u32 lba)
+{
+	u8 buf[BM_SD_BLOCK_SIZE];
+	u8 first;
+	u32 i;
+
+	if (bm_sd_read_blocks(lba, 1U, buf) != BM_SD_OK)
+	{
+		printf("[bm_sd] lock_demo: read fail\r\n");
+		return -1;
+	}
+
+	first = buf[0];
+	for (i = 1; i < sizeof(buf); i++)
+	{
+		if (buf[i] != first)
+		{
+			printf("[bm_sd] lock_demo FAIL: byte %u = 0x%02X, "
+			       "expected all 0x%02X (mixed!)\r\n", i, buf[i], first);
+			return -2;
+		}
+	}
+
+	if (first == 0xAA || first == 0x55)
+	{
+		printf("[bm_sd] lock_demo PASS: all 0x%02X\r\n", first);
+		return 0;
+	}
+
+	printf("[bm_sd] lock_demo FAIL: unknown pattern 0x%02X\r\n", first);
+	return -3;
+}
+
 #endif /* BM1684X_SD */

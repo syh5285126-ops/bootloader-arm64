@@ -49,6 +49,35 @@ static void bmOs3SdMemFree(void *ptr)
     free(ptr);
 }
 
+/*
+ * 天脉3工程可用 BSP/RTOS mutex 覆盖这三个弱符号。
+ * 默认返回 NULL，core 会退到原子锁兜底；产品形态建议接真 mutex。
+ */
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void *bmOs3SdMutexCreate(void)
+{
+    return NULL;
+}
+
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+int bmOs3SdMutexLock(void *mutex)
+{
+    (void)mutex;
+    return -1;
+}
+
+#if defined(__GNUC__)
+__attribute__((weak))
+#endif
+void bmOs3SdMutexUnlock(void *mutex)
+{
+    (void)mutex;
+}
+
 /*--------------------------------------------------------------------------
  * 中断号未核实，sem_xxx/irq_xxx 回调全部留空，引擎层检测到这些回调为 NULL 会
  * 自动走纯轮询模式，先求稳跑通；中断号确认后再接到天脉3 对应 API。
@@ -63,9 +92,9 @@ const BM1684X_SDHCI_OSAL g_bm1684xOsalOs3Sd = {
     NULL,             /* irq_enable  */
     bmOs3SdMemAlloc,  /* mem_alloc   */
     bmOs3SdMemFree,   /* mem_free    */
-    NULL,             /* mutex_create */
-    NULL,             /* mutex_lock   */
-    NULL,             /* mutex_unlock */
+    bmOs3SdMutexCreate, /* mutex_create */
+    bmOs3SdMutexLock,   /* mutex_lock   */
+    bmOs3SdMutexUnlock, /* mutex_unlock */
 };
 
 #endif /* BM1684X_SD */

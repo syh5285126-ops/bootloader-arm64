@@ -112,6 +112,104 @@ static int  g_highCapacity = 0;       /* 1=SDHC/SDXC（块寻址） 0=SDSC（字
 static u32  g_blockCount   = 0;       /* 用户区总扇区数（512B/扇区），由 CSD 解析得到 */
 
 /*--------------------------------------------------------------------------
+ * 控制器级互斥锁（与 eMMC 版本相同的双路径设计：优先 RTOS mutex，未对接时
+ * 原子锁兜底）。
+ *------------------------------------------------------------------------*/
+#ifndef BM_SD_LOCK_TIMEOUT_MS
+#define BM_SD_LOCK_TIMEOUT_MS 60000U
+#endif
+
+static void *g_ioMutex = NULL;
+static int g_ioLockReady = 0;
+static int g_ioLockUseMutex = 0;
+static volatile int g_ioLockInitBusy = 0;
+static volatile int g_ioSpinBusy = 0;
+
+static int bmAtomicTryLock(volatile int *lock)
+{
+#if defined(__GNUC__)
+    return __sync_lock_test_and_set(lock, 1) == 0;
+#else
+    if (*lock)
+        return 0;
+    *lock = 1;
+    return 1;
+#endif
+}
+
+static void bmAtomicUnlock(volatile int *lock)
+{
+#if defined(__GNUC__)
+    __sync_lock_release(lock);
+#else
+    *lock = 0;
+#endif
+}
+
+static int bmSdSpinLock(volatile int *lock, u32 timeoutMs)
+{
+    u32 left = timeoutMs * 100U;
+    while (!bmAtomicTryLock(lock))
+    {
+        if (left-- == 0U)
+            return BM_SD_ETIMEOUT;
+        delay_us(10);
+    }
+    return BM_SD_OK;
+}
+
+static int bmSdEnsureIoLock(void)
+{
+    if (g_ioLockReady)
+        return BM_SD_OK;
+
+    if (bmSdSpinLock(&g_ioLockInitBusy, BM_SD_LOCK_TIMEOUT_MS) != BM_SD_OK)
+        return BM_SD_ETIMEOUT;
+
+    if (!g_ioLockReady)
+    {
+        if (g_bm1684xOsalOs3Sd.mutex_create != NULL &&
+            g_bm1684xOsalOs3Sd.mutex_lock   != NULL &&
+            g_bm1684xOsalOs3Sd.mutex_unlock != NULL)
+        {
+            g_ioMutex = g_bm1684xOsalOs3Sd.mutex_create();
+            if (g_ioMutex != NULL)
+                g_ioLockUseMutex = 1;
+        }
+
+        if (!g_ioLockUseMutex)
+        {
+            /* ponytail: atomic fallback, replace with RTOS mutex if wait latency matters. */
+            printf("[bm_sd] OS mutex not hooked, use atomic fallback lock\r\n");
+        }
+        g_ioLockReady = 1;
+    }
+
+    bmAtomicUnlock(&g_ioLockInitBusy);
+    return BM_SD_OK;
+}
+
+static int bmSdIoLock(void)
+{
+    int ret = bmSdEnsureIoLock();
+    if (ret != BM_SD_OK)
+        return ret;
+
+    if (g_ioLockUseMutex)
+        return (g_bm1684xOsalOs3Sd.mutex_lock(g_ioMutex) == 0) ? BM_SD_OK : BM_SD_EIO;
+
+    return bmSdSpinLock(&g_ioSpinBusy, BM_SD_LOCK_TIMEOUT_MS);
+}
+
+static void bmSdIoUnlock(void)
+{
+    if (g_ioLockUseMutex)
+        g_bm1684xOsalOs3Sd.mutex_unlock(g_ioMutex);
+    else
+        bmAtomicUnlock(&g_ioSpinBusy);
+}
+
+/*--------------------------------------------------------------------------
  * TOP 域时钟使能 + 软复位（SD 通道：BM1684X_CLK_AXI_SD/_SD_200M/_100K_SD，
  * 复位位 BM1684X_RST_SD）。原因与 eMMC 版本完全相同——BootROM 只在"eMMC 是
  * 引导介质"场景下替前级软件把时钟/复位做好，SD 通道同样没有人在更早期做过
@@ -398,7 +496,7 @@ static u32 lbaToArg(u32 lba)
 /*--------------------------------------------------------------------------
  * 初始化：控制器（含 PHY/时钟）+ SD 卡识别
  *------------------------------------------------------------------------*/
-int bm_sd_init(void)
+static int bm_sd_init_locked(void)
 {
     BM1684X_MMC_CMD  cmd, acmd;
     int ret;
@@ -596,12 +694,31 @@ int bm_sd_init(void)
     return BM_SD_OK;
 }
 
+int bm_sd_init(void)
+{
+    int ret = bmSdIoLock();
+
+    if (ret != BM_SD_OK)
+        return ret;
+
+    ret = bm_sd_init_locked();
+    bmSdIoUnlock();
+    return ret;
+}
+
 int bm_sd_reinit(void)
 {
+    int ret = bmSdIoLock();
+
+    if (ret != BM_SD_OK)
+        return ret;
+
     g_inited     = 0;
     g_blockCount = 0;
     g_rca        = 0;
-    return bm_sd_init();
+    ret = bm_sd_init_locked();
+    bmSdIoUnlock();
+    return ret;
 }
 
 /*--------------------------------------------------------------------------
@@ -611,24 +728,28 @@ int bm_sd_read_blocks(u32 lba, u32 count, void *buf)
 {
     BM1684X_MMC_CMD  cmd;
     BM1684X_MMC_DATA data;
-    int ret;
+    int ret = BM_SD_OK;
 
-    if (!g_inited)
-    {
-        ret = bm_sd_init();
-        if (ret != BM_SD_OK)
-            return ret;
-    }
     if ((count == 0U) || (buf == NULL))
         return BM_SD_EPARAM;
 
-    /* 读卡前也要先 invalidate 接收缓冲区：参考驱动 bm_sd_prepare() 对读写
-     * 都无条件先做一次 flush_dcache_range()，不是只在写方向做。本驱动之前
-     * 只在"读完之后"invalidate 一次，漏了"读之前"这一次——如果 rbuf 之前
-     * 残留了缓存里的旧内容（哪怕是干净页、未必是脏页），DMA 写入期间该缓存行
-     * 一直有效，读完后再 invalidate 本应能强制重新取数；但实测板上复现出
-     * "读命令成功、字节0却是旧值0x00"，跟"读前没清缓存"这一类问题的典型现
-     * 象一致，按参考驱动的双向都清的口径补上更保险。*/
+    ret = bmSdIoLock();
+    if (ret != BM_SD_OK)
+        return ret;
+
+    if (!g_inited)
+    {
+        ret = bm_sd_init_locked();
+        if (ret != BM_SD_OK)
+            goto out;
+    }
+
+    /* 读卡前也要先 invalidate 接收缓冲区（与 eMMC 版本保持一致）：
+     * 参考驱动 bm_sd_prepare() 对读写都无条件先做一次缓存维护，不是只在读完
+     * 之后做。如果 buf 之前残留了缓存里的旧内容（哪怕是干净行），DMA 写入期间
+     * 该缓存行仍可能有效，导致读完后 CPU 命中旧值——实测复现过"读命令成功、
+     * 字节0却是旧值"，就是漏了读前这一次。补 dsb 保证"丢弃旧缓存行"排在
+     * 后面引擎层启动 DMA 的寄存器写之前。*/
     ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, buf, count * BM_SD_BLOCK_SIZE);
     BM_DSB();
 
@@ -641,26 +762,32 @@ int bm_sd_read_blocks(u32 lba, u32 count, void *buf)
     cmd.cmdArg   = lbaToArg(lba);
     cmd.respType = BM1684X_RESP_R1;
 
-    /* 改走 sdSendCmdDbg 包装：之前这里直接调引擎层，读失败时啥也不打印，
-     * 排不出是命令阶段还是数据阶段卡住的；现在和命令类排障走同一套日志。*/
     ret = sdSendCmdDbg("READ", &cmd, &data);
     if (ret != 0)
-        return BM_SD_EIO;
+    {
+        ret = BM_SD_EIO;
+        goto out;
+    }
 
-    /* 多块读(CMD18)是开放式命令，传完要显式发 CMD12 停止（不再靠 AUTO_CMD12）。
-     * 单块读(CMD17)自带终止，不需要 CMD12。*/
+    /* 多块读(CMD18)是开放式命令，传完要显式发 CMD12 停止 */
     if (count > 1U)
     {
         ret = sdStopTransmission();
         if (ret != 0)
-            return BM_SD_EIO;
+        {
+            ret = BM_SD_EIO;
+            goto out;
+        }
     }
 
     /* DMA 完成后先 dsb 排序，再 invalidate 接收缓冲区，强制 CPU 重新从内存
-     * 读取 DMA 刚写入的数据，避免读到缓存里的旧值（与 eMMC 版本相同处理）。*/
+     * 读取 DMA 刚写入的数据，避免读到缓存里的旧值。*/
     BM_DSB();
     ACoreOs_cache_invalidate(ACOREOS_CACHE_DAT, buf, count * BM_SD_BLOCK_SIZE);
-    return BM_SD_OK;
+
+out:
+    bmSdIoUnlock();
+    return ret;
 }
 
 /*--------------------------------------------------------------------------
@@ -670,20 +797,25 @@ int bm_sd_write_blocks(u32 lba, u32 count, const void *buf)
 {
     BM1684X_MMC_CMD  cmd;
     BM1684X_MMC_DATA data;
-    int ret;
+    int ret = BM_SD_OK;
 
-    if (!g_inited)
-    {
-        ret = bm_sd_init();
-        if (ret != BM_SD_OK)
-            return ret;
-    }
     if ((count == 0U) || (buf == NULL))
         return BM_SD_EPARAM;
 
+    ret = bmSdIoLock();
+    if (ret != BM_SD_OK)
+        return ret;
+
+    if (!g_inited)
+    {
+        ret = bm_sd_init_locked();
+        if (ret != BM_SD_OK)
+            goto out;
+    }
+
     /* 写卡前 flush 发送缓冲区，把 CPU 缓存里的最新数据刷到内存，DMA 才能
      * 读到正确内容；flush 后补一道 dsb，保证这件事排在引擎层启动 DMA 的
-     * 寄存器写之前完成（与 eMMC 版本相同处理）。*/
+     * 寄存器写之前完成。*/
     ACoreOs_cache_flush(ACOREOS_CACHE_DAT, (void *)buf, count * BM_SD_BLOCK_SIZE);
     BM_DSB();
 
@@ -698,24 +830,39 @@ int bm_sd_write_blocks(u32 lba, u32 count, const void *buf)
 
     ret = sdSendCmdDbg("WRITE", &cmd, &data);
     if (ret != 0)
-        return BM_SD_EIO;
+    {
+        ret = BM_SD_EIO;
+        goto out;
+    }
 
-    /* 多块写(CMD25)是开放式命令，传完要显式发 CMD12 停止（不再靠 AUTO_CMD12）。
-     * 单块写(CMD24)自带终止，不需要 CMD12。*/
+    /* 多块写(CMD25)是开放式命令，传完要显式发 CMD12 停止 */
     if (count > 1U)
     {
         ret = sdStopTransmission();
         if (ret != 0)
-            return BM_SD_EIO;
+        {
+            ret = BM_SD_EIO;
+            goto out;
+        }
     }
 
     /* 等卡内部编程完成，确保数据落盘 */
-    return sdWaitReady();
+    ret = sdWaitReady();
+
+out:
+    bmSdIoUnlock();
+    return ret;
 }
 
 u32 bm_sd_get_block_count(void)
 {
-    return g_blockCount;
+    u32 n;
+
+    if (bmSdIoLock() != BM_SD_OK)
+        return 0;
+    n = g_blockCount;
+    bmSdIoUnlock();
+    return n;
 }
 
 #endif /* BM1684X_SD */
